@@ -1,0 +1,3 @@
+pytesseract
+mss
+pillow

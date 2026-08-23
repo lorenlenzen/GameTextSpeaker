@@ -1,0 +1,24 @@
+# Python virtual environment -- recreate with:
+#   python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+venv/
+__pycache__/
+*.pyc
+
+# Per-user runtime state -- your screen region, popup marker, and GUI
+# settings are specific to your screen/game/preferences, not something to
+# share or overwrite someone else's copy of. Each computer generates its
+# own via the app itself (--select, --select-popup-marker, or just running
+# the GUI once).
+region.json
+popup_marker.json
+gui_settings.json
+
+# Downloaded voice models -- these are large (Piper voices are 60-140MB
+# each; Kokoro's model + voices file together are ~350MB) and GitHub
+# rejects anything over 100MB outright, so none of this belongs in git
+# regardless of size. See README.md's "Better voices" section for where to
+# download them from. The ** matches any depth, so this covers both
+# voices/model.onnx and voices/kokoro/model.onnx-style subfolders alike.
+voices/**/*.onnx
+voices/**/*.onnx.json
+voices/**/*.bin
