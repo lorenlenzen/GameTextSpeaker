@@ -26,14 +26,15 @@ import difflib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
-from platform_adapter import get_platform_adapter, exe_name, check_dependency, pick_region_from_image
+from platform_adapter import (
+    get_platform_adapter, check_dependency, pick_region_from_image, subprocess_no_window_kwargs,
+)
 
 CONFIG_PATH = Path(__file__).with_name("region.json")
 POPUP_MARKER_PATH = Path(__file__).with_name("popup_marker.json")
@@ -41,6 +42,10 @@ POPUP_MARKER_PATH = Path(__file__).with_name("popup_marker.json")
 # The one place this process asks "which OS am I on" -- everywhere else in
 # this file just calls PLATFORM's methods. See platform_adapter.py.
 PLATFORM = get_platform_adapter()
+
+# Extra subprocess.Popen kwargs so espeak-ng/piper don't flash a console
+# window on Windows every time they're spawned -- see subprocess_no_window_kwargs().
+_POPEN_KWARGS = subprocess_no_window_kwargs()
 
 
 def apply_cpu_affinity(affinity: str, log=print) -> None:
@@ -226,7 +231,8 @@ def _fix_stray_periods(text: str) -> str:
 
 def clean_ocr_text(text: str) -> str:
     """Drop OCR/screen-artifact noise that made it past the confidence
-    filter in ocr_image(): tokens with no letters or digits at all (a lone
+    filter in _ocr_image_tesseract() (Tesseract only -- see ocr_image()):
+    tokens with no letters or digits at all (a lone
     ".", "|", "_", "''", or the stray glyph a game's "continue" arrow often
     gets misread as), plus a period stray-inserted mid-sentence (see
     _fix_stray_periods()). Deliberately conservative about whole-token
@@ -240,9 +246,28 @@ def clean_ocr_text(text: str) -> str:
     return _fix_stray_periods(text)
 
 
-def ocr_image(img, lang: str, min_confidence: int = 40) -> str:
-    """OCRs `img` and filters out low-confidence tokens before they're
-    spoken. Screen artifacts -- dust on a texture, a UI border, a font's
+def ocr_image(img, lang: str, min_confidence: int = 40, engine: str = "tesseract", log=print) -> str:
+    """Dispatches to one of two OCR engines, then applies clean_ocr_text()
+    to the result either way -- the punctuation/stray-period cleanup is
+    engine-agnostic text cleanup, not something Tesseract-specific.
+
+    "tesseract" (default, and the only option on Linux): needs the
+    tesseract-ocr binary installed separately.
+
+    "windows": Windows' own built-in OCR (Windows.Media.Ocr -- the same
+    engine PowerToys' Text Extractor and the Snipping Tool use), via the
+    'winocr' package. Nothing to install beyond `pip install winocr` --
+    no separate binary, no PATH entry. The trade-off: unlike Tesseract's
+    image_to_data(), Windows' OCR API doesn't expose a per-word confidence
+    score, so `min_confidence`/--ocr-min-confidence has nothing to filter
+    on and is silently ignored for this engine (see _ocr_image_windows())."""
+    if engine == "windows":
+        return clean_ocr_text(_ocr_image_windows(img, lang))
+    return clean_ocr_text(_ocr_image_tesseract(img, lang, min_confidence))
+
+
+def _ocr_image_tesseract(img, lang: str, min_confidence: int) -> str:
+    """Screen artifacts -- dust on a texture, a UI border, a font's
     drop-shadow -- often get "recognized" as a stray character or short
     garbled word, but Tesseract itself is usually much less confident about
     those than it is about actual dialogue text, even when that dialogue
@@ -264,7 +289,38 @@ def ocr_image(img, lang: str, min_confidence: int = 40) -> str:
         if conf < min_confidence:
             continue
         words.append(word)
-    return clean_ocr_text(" ".join(words))
+    return " ".join(words)
+
+
+def _ocr_image_windows(img, lang: str) -> str:
+    """Runs OCR via Windows.Media.Ocr (the 'winocr' package), UNTESTED on
+    real Windows hardware like the rest of this project's Windows support.
+    `lang` here is a BCP-47 tag ("en", "ja", "fr", ...), NOT Tesseract's
+    3-letter code ("eng", "jpn", "fra") -- these are two unrelated naming
+    schemes from two unrelated OCR engines. run() maps the CLI's Tesseract-
+    flavored default ("eng") to "en" automatically when this engine is
+    selected and --lang was left at its default; pass an explicit BCP-47
+    tag yourself for anything else.
+
+    winocr.recognize_pil_sync() raises AssertionError (with a ready-to-run
+    PowerShell command as the message) when the requested language's OCR
+    pack isn't installed -- see README for what that command does."""
+    try:
+        import winocr
+    except ImportError:
+        sys.exit(
+            "Missing required package 'winocr', needed for --ocr-engine windows.\n"
+            "Install it with:  pip install winocr   (inside your venv)\n"
+            "(see README.md's Windows section for the full setup)"
+        )
+    try:
+        result = winocr.recognize_pil_sync(img, lang)
+    except AssertionError as e:
+        sys.exit(
+            f"Windows OCR language '{lang}' isn't installed. Install it by running this in an "
+            f"administrator PowerShell, then try again:\n{e}"
+        )
+    return (result.get("text") or "").strip()
 
 
 # Many RPGs/visual novels show a speaking character's name in its own label
@@ -325,8 +381,77 @@ def apply_speaker_name_mode(text: str, mode: str) -> str:
 # new one (best fit for live, fast-moving game dialogue).
 # --------------------------------------------------------------------------
 
+_ONNX_TENSOR_TYPE_RE = re.compile(r"tensor\((\w+)\)")
+_ONNX_TO_NUMPY_DTYPE = {
+    "float": "float32", "float16": "float16", "double": "float64",
+    "int8": "int8", "int16": "int16", "int32": "int32", "int64": "int64",
+    "uint8": "uint8", "uint16": "uint16", "uint32": "uint32", "uint64": "uint64",
+    "bool": "bool",
+}
+
+
+def _patch_kokoro_onnx_input_dtypes(kokoro, log=print):
+    """Works around a real bug in the kokoro-onnx package (confirmed
+    present both in the currently pip-installable version AND its latest
+    upstream source as of this writing -- see
+    https://github.com/thewh1teagle/kokoro-onnx/issues/155 for the same
+    class of bug against a different model file). Kokoro._create_audio()
+    decides the "speed" input's numpy dtype by which code branch it takes
+    (int32 if the model's inputs include one named "input_ids", float32
+    otherwise) instead of asking the ONNX model what dtype it actually
+    declared for that input -- and for the official kokoro-v1.0.onnx
+    release specifically, that guess is wrong: the model wants
+    tensor(float), but the "input_ids" branch sends tensor(int32), and
+    onnxruntime rejects it outright:
+        Unexpected input data type. Actual: (tensor(int32)), expected: (tensor(float))
+    Worse, this happens inside a background asyncio task
+    (kokoro_onnx.create_stream()'s process_batches()) that nothing here
+    ever awaits directly -- see _stream_kokoro_chunks() below -- so
+    instead of surfacing as an error, it silently produces zero audio and
+    hangs that one background thread forever, which is indistinguishable
+    from "Kokoro just isn't outputting sound" from the GUI.
+
+    Reimplementing _create_audio from scratch to fix this properly risks
+    drifting from upstream's own tokenizing/batching logic over time, so
+    instead this monkey-patches the loaded session's own .run() to coerce
+    each input array to whatever dtype the ONNX graph actually declared
+    for it, right before every inference call -- self-correcting for
+    whatever the real model wants instead of guessing, so it keeps working
+    even if upstream changes _create_audio's branching logic later, and
+    becomes a harmless no-op instead of a maintenance trap if upstream
+    ever fixes this dtype bug outright."""
+    try:
+        sess = kokoro.sess
+        expected_dtypes = {}
+        for inp in sess.get_inputs():
+            m = _ONNX_TENSOR_TYPE_RE.match(inp.type)
+            if m and m.group(1) in _ONNX_TO_NUMPY_DTYPE:
+                expected_dtypes[inp.name] = _ONNX_TO_NUMPY_DTYPE[m.group(1)]
+
+        original_run = sess.run
+
+        def patched_run(output_names, input_feed, run_options=None):
+            import numpy as np
+            fixed_feed = {}
+            for name, value in input_feed.items():
+                expected = expected_dtypes.get(name)
+                if expected is not None and hasattr(value, "dtype") and str(value.dtype) != expected:
+                    value = value.astype(expected)
+                fixed_feed[name] = value
+            return original_run(output_names, fixed_feed, run_options)
+
+        sess.run = patched_run
+    except Exception as e:
+        # Best-effort only -- if this patch itself fails for any reason
+        # (a kokoro-onnx internals change, an unexpected session shape),
+        # fall back to whatever kokoro-onnx would have done unpatched
+        # rather than blocking Kokoro from loading at all over a
+        # workaround for a bug it might not even hit.
+        log(f"[speech] Couldn't apply the Kokoro dtype workaround ({e}) -- continuing without it.")
+
+
 class Speaker:
-    """Two engines:
+    """Four engines:
 
     - "espeak" (default): espeak-ng, always available via apt, robotic but
       zero extra setup.
@@ -339,6 +464,14 @@ class Speaker:
       `pip install kokoro-onnx` plus two downloaded model files (see
       README). Synthesis is CPU-bound and happens in a background thread
       per line so it doesn't stall the OCR poll loop or delay pause/stop.
+    - "windows": Windows' own built-in SAPI5 voices (the classic "Microsoft
+      David"/"Microsoft Zira" tier, comparable quality to espeak-ng — NOT
+      the newer neural "Natural voices", which Microsoft restricts to
+      Narrator/Edge only), via `pip install pyttsx3`. Runs in-process (no
+      subprocess spawn at all), so it needs no PATH setup and produces no
+      console-window flicker. Windows-only; on any other platform this
+      engine simply won't be selectable (pyttsx3 wraps SAPI5, which doesn't
+      exist elsewhere).
     """
 
     def __init__(self, engine: str, rate: int, voice: str, piper_model: str, piper_speaker=None,
@@ -354,6 +487,15 @@ class Speaker:
         # hotkey fired, not just whatever's currently playing.
         self._pause_lock = threading.Lock()
         self._paused = False
+        # Guards self._utterance_id for engines that synthesize in a
+        # background thread (Kokoro, Windows/SAPI) rather than handing text
+        # straight to a subprocess -- see _say_kokoro_blocking_worker()'s
+        # comment for the full explanation of why this exists. Initialized
+        # unconditionally (not just inside those engines' branches below) so
+        # _stop_current() can safely bump it regardless of which engine is
+        # active.
+        self._utterance_id = 0
+        self._utterance_lock = threading.Lock()
 
         if engine == "espeak":
             check_dependency(
@@ -364,24 +506,32 @@ class Speaker:
             self.rate = rate
             self.voice = voice
         elif engine == "piper":
-            # Prefer the piper binary living alongside the Python interpreter
-            # currently running (i.e. in the same venv) over whatever a bare
-            # PATH search turns up. This matters because a launcher that
-            # runs venv/bin/python3 directly (skipping `source
-            # venv/bin/activate`, e.g. a .desktop entry) does NOT put
-            # venv/bin on PATH the way activation does — so shutil.which
-            # could silently find a different, incompatible `piper`
-            # elsewhere on the system instead of the one actually installed
-            # for this project.
-            venv_piper = Path(sys.executable).parent / exe_name("piper")
-            self.piper_bin = str(venv_piper) if venv_piper.exists() else shutil.which("piper")
-            if self.piper_bin is None:
+            # Historically this shelled out to a "piper" binary (subprocess,
+            # stdin/stdout piping) -- the right model for the OLD standalone
+            # Piper (a separate C++ project with real prebuilt binaries from
+            # its own GitHub releases). `pip install piper-tts` (what this
+            # project actually installs -- see setup.py) is a DIFFERENT,
+            # newer project: a pure Python + onnxruntime reimplementation.
+            # Its "piper" console-script binary (venv\Scripts\piper.exe on
+            # Windows) is just a pip-generated launcher stub hardcoded to
+            # that specific venv's own python.exe -- it works fine run from
+            # source (that venv genuinely exists there), but can't survive
+            # being frozen into a standalone .exe: there's no venv, and no
+            # python.exe file at all, shipped alongside it. Importing the
+            # package directly instead -- exactly how the "kokoro" branch
+            # below already does it -- sidesteps the whole problem: there's
+            # no external binary to go looking for, so there's nothing
+            # PyInstaller needs to bundle beyond the package itself (plus
+            # its bundled espeak-ng-data, handled by --collect-data=piper in
+            # setup.py/build_windows.py).
+            try:
+                from piper import PiperVoice
+            except ImportError:
                 sys.exit(
-                    "Missing required command 'piper'.\n"
+                    "Missing required package 'piper-tts'.\n"
                     "Install it with:  pip install piper-tts   (inside your venv — this one's pip, not apt)\n"
                     "(see README.md for the full setup, including downloading a voice model)"
                 )
-            self.log(f"Piper binary: {self.piper_bin}")
             if not piper_model:
                 sys.exit("--engine piper requires --piper-model /path/to/voice.onnx (see README for how to get one).")
             self.piper_model = Path(piper_model)
@@ -389,10 +539,17 @@ class Speaker:
                 sys.exit(f"Piper voice model not found: {self.piper_model}")
             PLATFORM.resolve_player("Piper", log=self.log)
 
+            self.log(f"Loading Piper model ({self.piper_model.name})...")
+            try:
+                self._piper_voice = PiperVoice.load(str(self.piper_model))
+            except Exception as e:
+                sys.exit(f"Failed to load Piper model: {e}")
+            self.log("Piper model loaded.")
+
             self.piper_length_scale = piper_length_scale
 
             self.piper_speaker = piper_speaker
-            num_speakers = self._piper_config().get("num_speakers", 1)
+            num_speakers = self._piper_voice.config.num_speakers
             if num_speakers and num_speakers > 1:
                 if self.piper_speaker is None:
                     self.piper_speaker = 0
@@ -441,12 +598,11 @@ class Speaker:
             except Exception as e:
                 sys.exit(f"Failed to load Kokoro model: {e}")
             self.log("Kokoro model loaded.")
+            _patch_kokoro_onnx_input_dtypes(self._kokoro, log=self.log)
 
             self.kokoro_voice = kokoro_voice or "af_heart"
             self.kokoro_speed = kokoro_speed if kokoro_speed is not None else 1.0
             self.kokoro_lang = kokoro_lang or "en-us"
-            self._utterance_id = 0
-            self._utterance_lock = threading.Lock()
             self._kokoro_streaming = hasattr(self._kokoro, "create_stream")
             if not self._kokoro_streaming:
                 self.log(
@@ -454,8 +610,35 @@ class Speaker:
                     "speech will wait for the whole line to finish synthesizing before playing anything. "
                     "Try: pip install -U kokoro-onnx"
                 )
+        elif engine == "windows":
+            if sys.platform != "win32":
+                sys.exit("--engine windows only works on Windows (it wraps SAPI5 via pyttsx3).")
+            try:
+                import pyttsx3
+            except ImportError:
+                sys.exit(
+                    "Missing required package 'pyttsx3'.\n"
+                    "Install it with:  pip install pyttsx3   (inside your venv — this one's pip, not apt)\n"
+                    "This wraps Windows' own built-in SAPI5 voices, so no extra download is needed beyond the package itself."
+                )
+            self._sapi_lock = threading.Lock()
+            self._sapi_engine = pyttsx3.init()
+            self._sapi_engine.setProperty("rate", rate)
+            if voice:
+                chosen = None
+                for v in self._sapi_engine.getProperty("voices"):
+                    if voice.lower() in v.name.lower() or voice == v.id:
+                        chosen = v.id
+                        break
+                if chosen is not None:
+                    self._sapi_engine.setProperty("voice", chosen)
+                else:
+                    self.log(
+                        f"[speech] No installed SAPI5 voice matched {voice!r} -- using the system default voice instead. "
+                        f"Leave --voice blank, or check the GUI's Voice dropdown for installed options."
+                    )
         else:
-            sys.exit(f"Unknown --engine {engine!r} (expected 'espeak', 'piper', or 'kokoro')")
+            sys.exit(f"Unknown --engine {engine!r} (expected 'espeak', 'piper', 'kokoro', or 'windows')")
 
     def _build_kokoro_session(self, model_path: str, num_threads: int):
         """Builds an onnxruntime InferenceSession with intra_op_num_threads
@@ -506,9 +689,11 @@ class Speaker:
             if self.voice:
                 cmd += ["-v", self.voice]
             cmd.append(text)
-            self._proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+            self._proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, **_POPEN_KWARGS)
         elif self.engine == "piper":
             self._say_piper(text)
+        elif self.engine == "windows":
+            self._say_windows_sapi(text)
         else:
             self._say_kokoro(text)
 
@@ -517,28 +702,54 @@ class Speaker:
         and on_pause_toggle in run()). Setting this to True makes any
         say() call already in flight -- or one that lands moments later,
         mid-OCR -- refuse to start anything new, then stops whatever's
-        currently playing. This
-        is what makes pause behave like stop instead of merely stopping
-        *current* playback and hoping nothing new sneaks in behind it."""
+        currently playing. This is what makes pause behave like stop
+        instead of merely stopping *current* playback and hoping nothing
+        new sneaks in behind it."""
         with self._pause_lock:
             self._paused = paused
         if paused:
             self._stop_current()
 
     def _say_piper(self, text: str):
-        piper_cmd = [self.piper_bin, "--model", str(self.piper_model), "--output-raw"]
-        if self.piper_speaker is not None:
-            piper_cmd += ["--speaker", str(self.piper_speaker)]
-        if self.piper_length_scale is not None:
-            piper_cmd += ["--length_scale", str(self.piper_length_scale)]
-        self._proc = subprocess.Popen(
-            piper_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        self._proc.stdin.write(text.encode("utf-8"))
-        self._proc.stdin.close()
+        # Runs in-process now (see the "piper" branch of __init__ for why),
+        # same shape as Kokoro just below: synthesis is CPU-bound, so it
+        # always happens in its own thread rather than blocking here and
+        # stalling the OCR poll loop.
+        with self._utterance_lock:
+            my_id = self._utterance_id
+        threading.Thread(target=self._say_piper_worker, args=(text, my_id), daemon=True).start()
 
-        rate = self._piper_config().get("audio", {}).get("sample_rate", 22050)
-        self._player_proc = PLATFORM.open_piped_player(self._proc.stdout, rate)
+    def _say_piper_worker(self, text: str, my_id: int):
+        """voice.synthesize() yields one AudioChunk per sentence, played as
+        each one is ready instead of waiting for the whole line -- same
+        streaming-over-waiting reasoning as Kokoro's streaming worker below,
+        just without asyncio since Piper's synthesize() is a plain,
+        synchronous generator."""
+        from piper import SynthesisConfig
+
+        syn_config = SynthesisConfig(
+            speaker_id=self.piper_speaker,
+            length_scale=self.piper_length_scale,
+        )
+        player = None
+        try:
+            for chunk in self._piper_voice.synthesize(text, syn_config):
+                with self._utterance_lock:
+                    if my_id != self._utterance_id:
+                        return  # superseded -- stop pulling/playing further chunks immediately
+                if player is None:
+                    player = PLATFORM.open_pcm_player(chunk.sample_rate)
+                    with self._utterance_lock:
+                        if my_id != self._utterance_id:
+                            player.terminate()
+                            return
+                        self._player_proc = player
+                player.write(chunk.audio_int16_bytes)
+        except Exception as e:
+            self.log(f"[speech] Piper synthesis failed: {e}")
+        finally:
+            if player is not None:
+                player.close_stdin()
 
     def _say_kokoro(self, text: str):
         # Kokoro's synthesis is a blocking, CPU-bound call, unlike
@@ -631,14 +842,60 @@ class Speaker:
             if player is not None:
                 player.close_stdin()
 
-    def _piper_config(self) -> dict:
-        cfg_path = Path(str(self.piper_model) + ".json")
-        if cfg_path.exists():
+    def _say_windows_sapi(self, text: str):
+        # pyttsx3's own .say()/.runAndWait() plays audio itself and only
+        # supports being interrupted via a documented-but-flaky cross-thread
+        # .stop() call. Rather than depend on that, this mirrors Kokoro's
+        # blocking-worker approach: synthesize to a temp WAV file (fast for
+        # SAPI5's classic voices, so the lack of streaming here is much less
+        # noticeable than it was for Kokoro), then hand the raw PCM to
+        # PLATFORM.open_pcm_player() -- the same generic player object that
+        # _stop_current() already knows how to terminate cleanly.
+        with self._utterance_lock:
+            my_id = self._utterance_id
+        threading.Thread(target=self._say_windows_sapi_worker, args=(text, my_id), daemon=True).start()
+
+    def _say_windows_sapi_worker(self, text: str, my_id: int):
+        import tempfile
+        import wave
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            wav_path = tmp.name
+        try:
+            with self._sapi_lock:
+                self._sapi_engine.save_to_file(text, wav_path)
+                self._sapi_engine.runAndWait()
+
+            with self._utterance_lock:
+                if my_id != self._utterance_id:
+                    return  # superseded while synthesizing -- drop it
+
             try:
-                return json.loads(cfg_path.read_text())
-            except Exception:
+                with wave.open(wav_path, "rb") as wf:
+                    sample_rate = wf.getframerate()
+                    pcm = wf.readframes(wf.getnframes())
+            except Exception as e:
+                self.log(f"[speech] Couldn't read SAPI5 output audio: {e}")
+                return
+
+            player = PLATFORM.open_pcm_player(sample_rate)
+            with self._utterance_lock:
+                if my_id != self._utterance_id:
+                    # Went stale in the gap between the check above and
+                    # actually starting playback -- kill it before it plays
+                    # over whatever superseded it.
+                    player.terminate()
+                    return
+                self._player_proc = player
+            player.write(pcm)
+            player.close_stdin()
+        except Exception as e:
+            self.log(f"[speech] SAPI5 synthesis failed: {e}")
+        finally:
+            try:
+                os.remove(wav_path)
+            except OSError:
                 pass
-        return {}
 
     def _check_finished(self, proc, label: str):
         """If `proc` already exited (on its own, not because we're about to
@@ -654,21 +911,22 @@ class Speaker:
             # subprocesses with code 1 instead. Either way, the only thing
             # in this script that ever kills one of these processes is the
             # .terminate() call a few lines down in _stop_current() itself
-            # (real Popens for espeak-ng/Piper/piped playback, and
-            # _SoundDevicePcmPlayer self-reports 0 on intentional shutdown
-            # rather than reaching this branch at all). So this is never a
-            # real failure: it's this same method, on some earlier call,
-            # having intentionally cut off speech that was still playing
-            # (new dialogue interrupting old, or the pause hotkey stopping
-            # mid-sentence) — surfacing it as an error would just be
-            # misreporting our own doing. NOTE: a genuine Piper/espeak-ng
-            # crash on Windows that happens to also exit with code 1 would
-            # be masked by this same check -- an acceptable trade-off here,
-            # same as it already is for -15 on Linux.
+            # (a real Popen for espeak-ng, and _SoundDevicePcmPlayer
+            # self-reports 0 on intentional shutdown rather than reaching
+            # this branch at all). So this is never a real failure: it's
+            # this same method, on some earlier call, having intentionally
+            # cut off speech that was still playing (new dialogue
+            # interrupting old, or the pause hotkey stopping mid-sentence)
+            # — surfacing it as an error would just be misreporting our own
+            # doing. NOTE: a genuine espeak-ng crash on Windows that happens
+            # to also exit with code 1 would be masked by this same check --
+            # an acceptable trade-off here, same as it already is for -15 on
+            # Linux.
             return
-        # self._proc is always a real subprocess.Popen (espeak-ng/piper);
+        # self._proc is a real subprocess.Popen only for espeak-ng now;
         # self._player_proc may instead be a platform_adapter.PcmPlayer
-        # (Kokoro always, Piper via open_piped_player()) -- read_stderr()
+        # (Kokoro, Piper, and Windows/SAPI5 all synthesize in-process and
+        # only ever produce a PcmPlayer, never a subprocess) -- read_stderr()
         # is how a PcmPlayer surfaces error text since it may not have a
         # real subprocess .stderr to read from (see _SoundDevicePcmPlayer).
         if hasattr(proc, "read_stderr"):
@@ -688,10 +946,16 @@ class Speaker:
     def _stop_current(self):
         self._check_finished(self._proc, "speech process")
         self._check_finished(self._player_proc, "playback process")
-        if self.engine == "kokoro":
-            # Invalidate any Kokoro synthesis still running in the
-            # background so it drops its result instead of playing a
-            # superseded (or post-pause/stop) line once it finishes.
+        if self.engine in ("kokoro", "windows", "piper"):
+            # Invalidate any Kokoro/SAPI5/Piper synthesis still running in
+            # the background so it drops its result instead of playing a
+            # superseded (or post-pause/stop) line once it finishes. Piper
+            # joined this list once it moved from a subprocess (killed by
+            # the .terminate() loop below same as espeak-ng always was) to
+            # in-process synthesis in a background thread -- a thread can't
+            # be killed the way a process can, so it needs this same
+            # cooperative "check the id, bail if superseded" mechanism
+            # Kokoro/SAPI5 already used.
             with self._utterance_lock:
                 self._utterance_id += 1
         for p in (self._player_proc, self._proc):
@@ -736,6 +1000,20 @@ def run(args, stop_event=None, log=print, on_pause_change=None):
         marker = load_popup_marker()
         if marker is None:
             sys.exit("--ignore-popups needs a saved marker. Run with --select-popup-marker first.")
+
+    ocr_engine = getattr(args, "ocr_engine", "tesseract") or "tesseract"
+    ocr_lang = args.lang
+    if ocr_engine == "windows":
+        if ocr_lang == "eng":
+            # "eng" is the CLI's Tesseract-flavored default -- Windows OCR
+            # wants a BCP-47 tag like "en" instead. Only remapped when
+            # --lang was left at that default, so an explicit non-English
+            # --lang (e.g. "ja") still passes through untouched.
+            ocr_lang = "en"
+        log(
+            "OCR: Windows built-in engine (Tesseract not required). Note: this engine has no "
+            "per-word confidence score, so --ocr-min-confidence has no effect."
+        )
 
     region = load_region()
     capturer = PLATFORM.make_capturer(region)
@@ -823,7 +1101,8 @@ def run(args, stop_event=None, log=print, on_pause_change=None):
 
             img = capturer.grab()
             img = preprocess_for_ocr(img)
-            text = ocr_image(img, lang=args.lang, min_confidence=getattr(args, "ocr_min_confidence", 40))
+            text = ocr_image(img, lang=ocr_lang, min_confidence=getattr(args, "ocr_min_confidence", 40),
+                              engine=ocr_engine, log=log)
             text = apply_speaker_name_mode(text, getattr(args, "speaker_name_mode", "off"))
 
             if text and similar(text, last_text) < args.similarity:
@@ -861,11 +1140,28 @@ def main():
                          help="Max color distance (0-441) for the popup marker to still count as matched (default 20). Raise if popups get missed; lower if false positives skip real dialogue.")
     parser.add_argument("--run", action="store_true", help="Start the OCR -> speech loop.")
     parser.add_argument("--interval", type=float, default=0.5, help="Seconds between screen captures (default 0.5).")
-    parser.add_argument("--lang", default="eng", help="Tesseract language code (default eng).")
+    parser.add_argument("--ocr-engine", choices=["tesseract", "windows"],
+                         default="windows" if sys.platform == "win32" else "tesseract",
+                         help="OCR backend: 'tesseract' (default on Linux, needs the tesseract-ocr binary "
+                              "installed separately) or 'windows' (default on Windows, uses the OS's own "
+                              "built-in OCR via the 'winocr' package -- no separate binary or PATH entry "
+                              "needed, but it has no per-word confidence score, so --ocr-min-confidence has "
+                              "no effect on it). Pass --ocr-engine tesseract on Windows to use Tesseract "
+                              "instead, if you have it installed and prefer its cleanup filtering.")
+    parser.add_argument("--lang", default="eng",
+                         help="OCR language code (default 'eng'). Meaning depends on --ocr-engine: "
+                              "Tesseract wants its own 3-letter codes (e.g. 'eng', 'fra' -- needs "
+                              "tesseract-ocr-<lang> installed for anything but English); the 'windows' "
+                              "engine wants a BCP-47 tag instead (e.g. 'en', 'ja', 'fr' -- needs that "
+                              "language's OCR pack installed in Windows). The default is remapped from "
+                              "'eng' to 'en' automatically when --ocr-engine windows is used and --lang "
+                              "wasn't set explicitly.")
     parser.add_argument("--ocr-min-confidence", type=int, default=40, metavar="0-100",
-                         help="Discard OCR'd words below this Tesseract confidence score (default 40). "
+                         help="Discard OCR'd words below this confidence score (default 40). "
                               "Raise it if screen artifacts (dust, UI borders, icons) are getting spoken as "
-                              "stray punctuation or gibberish words; lower it if real dialogue is getting dropped.")
+                              "stray punctuation or gibberish words; lower it if real dialogue is getting "
+                              "dropped. Only applies to --ocr-engine tesseract -- the 'windows' engine has "
+                              "no per-word confidence score to filter on, so this is silently ignored there.")
     parser.add_argument("--speaker-name-mode", choices=["off", "skip", "announce"], default="off",
                          help="For dialogue boxes that show a character's name above their quoted line (which "
                               "OCR runs straight into the dialogue, e.g. 'Augustin El Borne \"And this must "
@@ -875,8 +1171,9 @@ def main():
                               "label immediately before a quote mark, so ordinary narration is left alone.")
     parser.add_argument("--rate", type=int, default=175, help="espeak-ng speech rate, words/min (default 175, ignored by --engine piper/kokoro).")
     parser.add_argument("--voice", default="", help="espeak-ng voice, e.g. en-us or mb-us1 (default: system default). Ignored by --engine piper/kokoro.")
-    parser.add_argument("--engine", choices=["espeak", "piper", "kokoro"], default="espeak",
-                         help="TTS engine: 'espeak' (default, robotic, zero setup), 'piper' (natural neural voices, needs pip install piper-tts + a downloaded model), or 'kokoro' (most natural of the three, needs pip install kokoro-onnx + two downloaded model files — see README).")
+    parser.add_argument("--engine", choices=["espeak", "piper", "kokoro", "windows"],
+                         default="windows" if sys.platform == "win32" else "espeak",
+                         help="TTS engine: 'espeak' (default on Linux; robotic, needs espeak-ng installed separately), 'piper' (natural neural voices, needs pip install piper-tts + a downloaded model), 'kokoro' (most natural of the four, needs pip install kokoro-onnx + two downloaded model files), or 'windows' (default on Windows; Windows-only, the built-in SAPI5 voices, comparable quality to espeak-ng, needs pip install pyttsx3 but no PATH setup or downloaded model — see README).")
     parser.add_argument("--piper-model", default="", metavar="PATH",
                          help="Path to a Piper voice .onnx model file. Required when --engine piper.")
     parser.add_argument("--piper-speaker", type=int, default=None, metavar="ID",

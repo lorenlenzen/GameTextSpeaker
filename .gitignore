@@ -1,17 +1,17 @@
-# Python virtual environment -- recreate with:
-#   python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+# Python virtual environment -- recreate with:  python3 setup.py
 venv/
 __pycache__/
 *.pyc
 
-# Per-user runtime state -- your screen region, popup marker, and GUI
-# settings are specific to your screen/game/preferences, not something to
-# share or overwrite someone else's copy of. Each computer generates its
-# own via the app itself (--select, --select-popup-marker, or just running
-# the GUI once).
+# Per-user runtime state -- your screen region, popup marker, GUI settings,
+# and setup.py's remembered checkbox selections are specific to your
+# screen/game/preferences/machine, not something to share or overwrite
+# someone else's copy of. Each computer regenerates its own (via the app
+# itself for the first three; via setup.py for the last one).
 region.json
 popup_marker.json
 gui_settings.json
+setup_settings.json
 
 # Downloaded voice models -- these are large (Piper voices are 60-140MB
 # each; Kokoro's model + voices file together are ~350MB) and GitHub
@@ -23,11 +23,11 @@ voices/**/*.onnx
 voices/**/*.onnx.json
 voices/**/*.bin
 
-# PyInstaller build output (build_windows.py) -- the whole point of that
-# script is that everyone builds their own .exe from source rather than
-# one being committed or shipped in the repo. build/ is PyInstaller's
-# scratch work area; dist/ is where the finished app actually ends up.
-# The .spec file is auto-generated fresh by build_windows.py every run,
+# PyInstaller build output (setup.py's "Build standalone .exe" button) --
+# the whole point of that button is that everyone builds their own .exe
+# from source rather than one being committed or shipped in the repo.
+# build/ is PyInstaller's scratch work area; dist/ is where the finished
+# app actually ends up. The .spec file is auto-generated fresh every run,
 # so it doesn't need to be tracked either.
 build/
 dist/

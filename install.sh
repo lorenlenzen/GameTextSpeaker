@@ -37,6 +37,6 @@ echo "(Launcher written to: $DEST_FILE)"
 echo
 if [ ! -d "$APP_DIR/venv" ]; then
     echo "Note: no venv/ found yet at $APP_DIR -- the launcher won't work until you"
-    echo "finish setup. See README.md's \"Install dependencies\" section:"
-    echo "  python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
+    echo "finish setup. Run:"
+    echo "  python3 setup.py"
 fi

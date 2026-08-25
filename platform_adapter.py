@@ -37,6 +37,20 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 
+def subprocess_no_window_kwargs() -> dict:
+    """Extra kwargs for subprocess.Popen/run, so spawning a console-mode
+    child process (espeak-ng.exe, piper.exe) doesn't flash its own console
+    window on screen. This app has no console UI of its own to inherit, so
+    Windows creating one from scratch for every single child process --
+    once per utterance, i.e. constantly while dialogue is being read -- is
+    pure visual noise, not an error. subprocess.CREATE_NO_WINDOW only
+    exists on Windows; this is a no-op {} everywhere else, where spawning a
+    subprocess never opens a visible window in the first place."""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
 def exe_name(base: str) -> str:
     """'piper' -> 'piper.exe' on Windows, unchanged elsewhere. Windows'
     PATH search adds this suffix automatically for shutil.which(), but not

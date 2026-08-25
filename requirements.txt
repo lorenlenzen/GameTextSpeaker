@@ -1,3 +1,7 @@
-pytesseract
+# True base requirements only -- screen capture + image handling, needed
+# no matter which OCR/speech engines you end up using. Everything engine-
+# specific (pytesseract, winocr, piper-tts, kokoro-onnx, pyttsx3, evdev/
+# keyboard, sounddevice, psutil) is installed based on what you pick when
+# you run `python3 setup.py` instead of being listed here -- see README.md.
 mss
 pillow
