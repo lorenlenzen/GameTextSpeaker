@@ -3,7 +3,8 @@
 A small accessibility pipeline: watch a rectangle of your screen (a game's
 dialogue box, subtitle area, etc.), OCR whatever text appears there, and
 speak it aloud automatically. Built for Linux, works under both X11 and
-Wayland desktop sessions.
+Wayland desktop sessions. Windows is also supported, experimentally — see
+the [Windows](#windows-experimental) section below.
 
 Pipeline: **screen region → OCR (Tesseract) → speech (espeak-ng/piper/kokoro)**
 
@@ -192,7 +193,7 @@ it skips dialogue that isn't a popup, or re-pick a more distinctive spot.
 | `--kokoro-speed` | `1.0` | Kokoro speed multiplier. **Higher = faster**, **lower = slower** — the *opposite* direction from `--piper-length-scale`. |
 | `--kokoro-lang` | `en-us` | Kokoro language code. |
 | `--kokoro-cpu-threads` | unset | Caps CPU threads for a single Kokoro synthesis call. If the game is already maxing out your CPU, letting one call fight for every thread tends to cause *longer* pauses, not faster speech — try capping it (e.g. `6` on an 8-core/16-thread CPU) and see if pauses smooth out. Needs a `kokoro-onnx` with `Kokoro.from_session()`; older installs log a note and ignore this. |
-| `--cpu-affinity` | unset | Pins the whole process (OCR + Kokoro) to specific CPU cores, e.g. `--cpu-affinity 4,5,6,7`, reserving real uncontended time instead of time-sharing with the game. Pair with `--kokoro-cpu-threads` set to the same core count. Linux only. |
+| `--cpu-affinity` | unset | Pins the whole process (OCR + Kokoro) to specific CPU cores, e.g. `--cpu-affinity 4,5,6,7`, reserving real uncontended time instead of time-sharing with the game. Pair with `--kokoro-cpu-threads` set to the same core count. Works on Linux (built in) and Windows (needs `pip install psutil`); a no-op elsewhere. |
 | `--lang` | `eng` | Tesseract language code, e.g. `--lang fra` for French. Needs `tesseract-ocr-<lang>` installed. |
 | `--similarity` | `0.92` | How similar new OCR text has to be to the last line to count as "unchanged" and get skipped (0–1). Lower it if fast-scrolling text gets skipped; raise it if OCR jitter causes repeats. If a line is still being read aloud when new text arrives, the old one is cut off in favor of the new. |
 | `--ocr-min-confidence` | `40` | Drops OCR'd words below this Tesseract confidence score (0–100) before they're spoken — cleans up screen artifacts (dust, UI borders, icons) that would otherwise be read as stray punctuation or gibberish. Raise it if artifacts still slip through; lower it if real dialogue starts getting dropped. A period landing mid-sentence (e.g. a smudge OCR'd as "young. man") is always dropped too, since real sentence-ending periods are followed by a capitalized word — a short list of abbreviations (`Mr.`, `Dr.`, `etc.`, ...) is exempted. |
@@ -212,9 +213,9 @@ press it again to resume (it re-speaks whatever's currently in the
 dialogue box). Default is **space**; change it with `--pause-key <name>`
 (try `f9`, `scrolllock`, etc.), or set it to an empty string to disable.
 
-This reads raw keyboard events from the Linux kernel (via `evdev`) rather
-than a "global hotkey" library, since those don't work under Wayland. Two
-things follow:
+On Linux, this reads raw keyboard events from the kernel (via `evdev`)
+rather than a "global hotkey" library, since those don't work under
+Wayland. Two things follow:
 
 - **Needs the `evdev` package**: `pip install evdev` (inside your venv).
   If it's missing, `/dev/input` isn't readable, or the key name isn't
@@ -222,6 +223,11 @@ things follow:
 - **Needs read access to `/dev/input`** — usually the `input` group:
   `sudo usermod -aG input $USER`, then **log all the way out and back in**
   for it to take effect.
+
+On Windows, there's no X11-vs-Wayland split to work around, so this uses
+the `keyboard` package's global hook instead: `pip install keyboard`
+(inside your venv). Same degrade-gracefully behavior if it's missing or
+the key name isn't recognized.
 
 **Caveat:** this only *watches* the key, it doesn't intercept it, so
 whatever the game does with that key still happens too. If your game
@@ -284,8 +290,9 @@ Run with:
 python3 game_text_speaker.py --run --engine piper --piper-model voices/en_US-lessac-medium.onnx
 ```
 
-Needs `aplay` or `paplay` (`sudo apt install alsa-utils` or
-`pulseaudio-utils` if missing).
+Needs `aplay` or `paplay` on Linux (`sudo apt install alsa-utils` or
+`pulseaudio-utils` if missing); on Windows, needs `pip install sounddevice`
+instead (see [Windows](#windows-experimental)).
 
 **Multi-speaker models** (check a model's `.onnx.json` for `"num_speakers"`
 > 1) need `--piper-speaker <id>` — left unset, the script defaults to
@@ -331,7 +338,7 @@ one is too much download — same usage, slightly lower quality.) Run with:
 python3 game_text_speaker.py --run --engine kokoro --kokoro-model voices/kokoro-v1.0.onnx --kokoro-voices voices/voices-v1.0.bin
 ```
 
-Needs `aplay`/`paplay` like Piper. The first line spoken has a short delay
+Needs `aplay`/`paplay` (or `sounddevice` on Windows) like Piper. The first line spoken has a short delay
 while the model loads; after that, synthesis runs in the background and
 is played back chunk-by-chunk as it's generated, so it doesn't hold up
 screen-watching or the pause hotkey. If CPU load is causing pauses, see
@@ -354,6 +361,82 @@ from Piper: **higher = faster** (`2.0` = double), **lower = slower**
 Voice models can live anywhere — just update `--piper-model`/
 `--kokoro-model` to match (keep Piper's `.onnx`/`.onnx.json` pair together;
 Kokoro's two files can live independently).
+
+## Windows (experimental)
+
+Windows support exists but is new and, since this project is developed on
+Linux, hasn't been run on real Windows hardware — if something below
+doesn't work, that's expected territory; please open an issue with what
+happened. Everything above this section (usage, options, voices, pausing)
+works the same way on Windows; this section covers what's different about
+getting set up, plus building a standalone `.exe`.
+
+**Install dependencies.**
+
+- [Python 3](https://www.python.org/downloads/) — when installing, check
+  "Add python.exe to PATH". This also brings `tkinter` along with it (no
+  separate install needed, unlike Linux's `python3-tk`).
+- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) — the
+  UB Mannheim installer is the standard Windows build. If OCR comes back
+  empty, its install folder probably isn't on PATH — add it (typically
+  `C:\Program Files\Tesseract-OCR`) via Windows' "Edit environment
+  variables" dialog.
+- [espeak-ng](https://github.com/espeak-ng/espeak-ng/releases) — grab the
+  `.msi` installer from the latest release. Only needed if you're using
+  the default `espeak` engine rather than Piper/Kokoro.
+
+Then, in a terminal (PowerShell or cmd), from the folder you extracted the
+code into:
+
+```powershell
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+(`venv\Scripts\activate` is the Windows equivalent of Linux's
+`source venv/bin/activate` — run it again in any new terminal before using
+the script.) Launch the GUI the same way as Linux: `python gui.py`.
+
+**Region selection works differently.** There's no Windows equivalent of
+`slop`/`slurp`, so `--select` (and the GUI's "Select Region…" button) takes
+a screenshot first and lets you drag a box on that, the same
+no-time-pressure mechanism `--select-from-image` already uses on Linux for
+games that can't be alt-tabbed away from — you don't need to do anything
+differently, it just always works this way on Windows.
+
+**Optional extras**, matching the pip installs already covered above and
+in "Pausing the narrator" — install whichever you're actually using:
+
+| Feature | Linux | Windows |
+|---|---|---|
+| Piper voices | `pip install piper-tts` | same |
+| Kokoro voices | `pip install kokoro-onnx` | same |
+| Piper/Kokoro audio playback | `aplay`/`paplay` (system) | `pip install sounddevice` |
+| Pause hotkey | `pip install evdev` | `pip install keyboard` |
+| `--cpu-affinity` | built in | `pip install psutil` |
+
+**Building a standalone `.exe`.** So people you share this with don't need
+Python installed at all, `build_windows.py` (included in the repo) wraps
+[PyInstaller](https://pyinstaller.org/) into a one-command build:
+
+```powershell
+pip install pyinstaller
+python build_windows.py
+```
+
+This produces `dist\game-text-speaker\game-text-speaker.exe`, bundling
+Python and whichever pip packages are installed in the venv you build
+from — so build it *after* installing whichever of Piper/Kokoro/keyboard/
+sounddevice/psutil you want included. Tesseract and espeak-ng are still
+separate system installs either way (PyInstaller only bundles Python
+code), so anyone you hand the `.exe` to still needs those two installed
+per the steps above. Like the rest of Windows support, this build script
+is unverified on real hardware — see its own comments for the most likely
+things to check if the build or the resulting `.exe` misbehaves.
+
+The built `.exe` itself is intentionally never committed to the repo —
+see `.gitignore` and `build_windows.py`'s own comments for why.
 
 ## Troubleshooting
 

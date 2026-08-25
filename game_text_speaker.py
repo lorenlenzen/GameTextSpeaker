@@ -3,8 +3,9 @@
 game_text_speaker.py — OCR-to-speech accessibility pipeline for games.
 
 Watches a chosen rectangle of your screen (e.g. a dialogue box), OCRs it on
-a poll loop, and speaks new/changed text aloud via espeak-ng. Works on both
-X11 (using slop + mss) and Wayland (using slurp + grim).
+a poll loop, and speaks new/changed text aloud via espeak-ng. Runs on Linux
+(X11 via slop+mss, or Wayland via slurp+grim) and, experimentally, Windows —
+see platform_adapter.py for exactly what differs between them.
 
 Usage:
     # One-time: drag a box around the text area you want watched.
@@ -22,8 +23,6 @@ See README.md for install instructions and troubleshooting.
 import argparse
 import asyncio
 import difflib
-import glob
-import io
 import json
 import os
 import re
@@ -34,50 +33,18 @@ import threading
 import time
 from pathlib import Path
 
+from platform_adapter import get_platform_adapter, exe_name, check_dependency, pick_region_from_image
+
 CONFIG_PATH = Path(__file__).with_name("region.json")
 POPUP_MARKER_PATH = Path(__file__).with_name("popup_marker.json")
 
-
-# --------------------------------------------------------------------------
-# Session detection (X11 vs Wayland) — the two desktop stacks need
-# different tools for "let the user drag a box" and "screenshot a box".
-# --------------------------------------------------------------------------
-
-def is_wayland() -> bool:
-    return bool(os.environ.get("WAYLAND_DISPLAY")) or os.environ.get("XDG_SESSION_TYPE") == "wayland"
-
-
-def check_dependency(cmd: str, apt_pkg: str) -> None:
-    if shutil.which(cmd) is None:
-        sys.exit(
-            f"Missing required command '{cmd}'.\n"
-            f"Install it with:  sudo apt install {apt_pkg}\n"
-            f"(see README.md for the full dependency list)"
-        )
+# The one place this process asks "which OS am I on" -- everywhere else in
+# this file just calls PLATFORM's methods. See platform_adapter.py.
+PLATFORM = get_platform_adapter()
 
 
 def apply_cpu_affinity(affinity: str, log=print) -> None:
-    """Pins this whole process (OCR loop + Tesseract calls + Kokoro/Piper
-    synthesis, since affinity is inherited by every thread) to a specific
-    set of CPU cores, e.g. "12,13,14,15". On a busy system -- a demanding
-    game hogging every core -- this reserves real, uncontended CPU time for
-    the narrator instead of leaving the OS scheduler to time-share it with
-    everything else, which is what causes long, unpredictable pauses before
-    a line starts playing. Linux-only (os.sched_setaffinity doesn't exist
-    on macOS/Windows); a no-op if `affinity` is empty."""
-    if not affinity:
-        return
-    if not hasattr(os, "sched_setaffinity"):
-        log("[cpu-affinity] Not supported on this OS (Linux-only) -- ignoring --cpu-affinity.")
-        return
-    try:
-        cores = {int(c.strip()) for c in affinity.split(",") if c.strip() != ""}
-        if not cores:
-            return
-        os.sched_setaffinity(0, cores)
-        log(f"[cpu-affinity] Pinned this process to CPU core(s): {sorted(cores)}")
-    except Exception as e:
-        log(f"[cpu-affinity] Couldn't set CPU affinity {affinity!r}: {e}")
+    PLATFORM.set_cpu_affinity(affinity, log=log)
 
 
 # --------------------------------------------------------------------------
@@ -86,22 +53,7 @@ def apply_cpu_affinity(affinity: str, log=print) -> None:
 
 def select_region(log=print) -> dict:
     log("Drag a box around the text area you want watched (e.g. the dialogue box)...")
-    if is_wayland():
-        check_dependency("slurp", "slurp")
-        out = subprocess.run(["slurp"], capture_output=True, text=True, check=True).stdout.strip()
-        # slurp output format: "X,Y WxH"
-        m = re.match(r"(\d+),(\d+)\s+(\d+)x(\d+)", out)
-        if not m:
-            sys.exit(f"Couldn't parse slurp output: {out!r}")
-        x, y, w, h = map(int, m.groups())
-    else:
-        check_dependency("slop", "slop")
-        out = subprocess.run(
-            ["slop", "-f", "%x %y %w %h"], capture_output=True, text=True, check=True
-        ).stdout.strip()
-        x, y, w, h = map(int, out.split())
-
-    region = {"x": x, "y": y, "w": w, "h": h}
+    region = PLATFORM.select_region(log=log)
     CONFIG_PATH.write_text(json.dumps(region, indent=2))
     log(f"Saved region {region} to {CONFIG_PATH}")
     return region
@@ -143,22 +95,8 @@ def select_popup_marker(log=print) -> dict:
         "overlay. Avoid text (it varies); a small solid-ish patch of color "
         "works best."
     )
-    if is_wayland():
-        check_dependency("slurp", "slurp")
-        out = subprocess.run(["slurp"], capture_output=True, text=True, check=True).stdout.strip()
-        m = re.match(r"(\d+),(\d+)\s+(\d+)x(\d+)", out)
-        if not m:
-            sys.exit(f"Couldn't parse slurp output: {out!r}")
-        x, y, w, h = map(int, m.groups())
-    else:
-        check_dependency("slop", "slop")
-        out = subprocess.run(
-            ["slop", "-f", "%x %y %w %h"], capture_output=True, text=True, check=True
-        ).stdout.strip()
-        x, y, w, h = map(int, out.split())
-
-    marker_region = {"x": x, "y": y, "w": w, "h": h}
-    capturer = ScreenCapturer(marker_region)
+    marker_region = PLATFORM.select_region(log=log)
+    capturer = PLATFORM.make_capturer(marker_region)
     ref_color = average_color(capturer.grab())
 
     marker = {**marker_region, "ref_color": ref_color}
@@ -181,11 +119,14 @@ def load_popup_marker():
 
 def select_region_from_image(image_path: str, master=None, log=print) -> dict:
     """Fallback region picker for when the game can't be alt-tabbed away
-    from (e.g. exclusive fullscreen blocks slop/slurp's overlay). You take
-    a full-screen screenshot *of your desktop* while the text is visible
-    (Steam's F12 screenshot key works even over fullscreen games), then
-    point this at that saved image file to click-drag a box on it at your
-    own pace, with no window-switching timing involved.
+    from (e.g. exclusive fullscreen blocks slop/slurp's overlay on Linux).
+    You take a full-screen screenshot *of your desktop* while the text is
+    visible (Steam's F12 screenshot key works even over fullscreen games),
+    then point this at that saved image file to click-drag a box on it at
+    your own pace, with no window-switching timing involved. (On Windows,
+    --select already screenshots first for the same no-time-pressure
+    effect — see WindowsAdapter.select_region() — but this remains useful
+    there too for picking a region from an old/saved screenshot.)
 
     IMPORTANT: this only produces correct coordinates for the LIVE capture
     step later if the screenshot's pixel dimensions match what a live
@@ -206,14 +147,7 @@ def select_region_from_image(image_path: str, master=None, log=print) -> dict:
             raise RuntimeError(msg)
         sys.exit(msg)
 
-    try:
-        import tkinter as tk
-    except ImportError:
-        fail(
-            "Missing tkinter. Install it with:  sudo apt install python3-tk\n"
-            "(needed only for --select-from-image; --select doesn't need it)"
-        )
-    from PIL import Image, ImageTk
+    from PIL import Image
 
     path = Path(image_path)
     if not path.exists():
@@ -221,61 +155,8 @@ def select_region_from_image(image_path: str, master=None, log=print) -> dict:
 
     img = Image.open(path).convert("RGB")
     img_w, img_h = img.size
+    result = pick_region_from_image(img, master=master, log=log)
 
-    window = tk.Toplevel(master) if master is not None else tk.Tk()
-    window.title("Click and drag a box around the text, then release")
-    screen_w, screen_h = window.winfo_screenwidth(), window.winfo_screenheight()
-    scale = min(1.0, (screen_w * 0.9) / img_w, (screen_h * 0.9) / img_h)
-    disp_w, disp_h = int(img_w * scale), int(img_h * scale)
-
-    display_img = img.resize((disp_w, disp_h), resample=Image.LANCZOS) if scale < 1.0 else img
-    photo = ImageTk.PhotoImage(display_img, master=window)
-
-    label = tk.Label(window, text="Click and drag a box around the text area, then release.", fg="white", bg="black")
-    label.pack(fill="x")
-    canvas = tk.Canvas(window, width=disp_w, height=disp_h, cursor="crosshair")
-    canvas.pack()
-    canvas.create_image(0, 0, anchor="nw", image=photo)
-
-    result = {}
-    rect_id = {"id": None}
-    start = {}
-
-    def on_press(event):
-        start["x"], start["y"] = event.x, event.y
-        if rect_id["id"] is not None:
-            canvas.delete(rect_id["id"])
-        rect_id["id"] = canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="red", width=2)
-
-    def on_drag(event):
-        canvas.coords(rect_id["id"], start["x"], start["y"], event.x, event.y)
-
-    def on_release(event):
-        x0, y0 = start["x"], start["y"]
-        x1, y1 = event.x, event.y
-        left, right = sorted((x0, x1))
-        top, bottom = sorted((y0, y1))
-        # Scale back up from displayed (possibly shrunk) coords to the
-        # original screenshot's pixel coordinates.
-        result["x"] = int(left / scale)
-        result["y"] = int(top / scale)
-        result["w"] = int((right - left) / scale)
-        result["h"] = int((bottom - top) / scale)
-        window.destroy()
-
-    canvas.bind("<ButtonPress-1>", on_press)
-    canvas.bind("<B1-Motion>", on_drag)
-    canvas.bind("<ButtonRelease-1>", on_release)
-
-    if master is not None:
-        master.wait_window(window)  # pumps the GUI's event loop until this window closes
-    else:
-        window.mainloop()
-
-    if not result or result["w"] <= 0 or result["h"] <= 0:
-        fail("No region selected (or selection had zero size). Try again.")
-
-    log(f"Screenshot was {img_w}x{img_h}px.")
     try:
         import mss
         with mss.mss() as sct:
@@ -293,40 +174,6 @@ def select_region_from_image(image_path: str, master=None, log=print) -> dict:
     CONFIG_PATH.write_text(json.dumps(result, indent=2))
     log(f"Saved region {result} to {CONFIG_PATH}")
     return result
-
-
-# --------------------------------------------------------------------------
-# Screen capture
-# --------------------------------------------------------------------------
-
-class ScreenCapturer:
-    """Grabs the configured region as a PIL Image, on X11 or Wayland."""
-
-    def __init__(self, region: dict):
-        self.region = region
-        self.wayland = is_wayland()
-        if self.wayland:
-            check_dependency("grim", "grim")
-        else:
-            try:
-                import mss  # noqa: F401
-            except ImportError:
-                sys.exit("Missing python package 'mss'. Install with: pip install --user mss")
-            import mss as _mss
-            self._mss = _mss.mss()
-
-    def grab(self, region: dict = None):
-        from PIL import Image
-
-        r = region or self.region
-        if self.wayland:
-            geometry = f"{r['x']},{r['y']} {r['w']}x{r['h']}"
-            proc = subprocess.run(["grim", "-g", geometry, "-"], capture_output=True, check=True)
-            return Image.open(io.BytesIO(proc.stdout)).convert("RGB")
-        else:
-            box = {"left": r["x"], "top": r["y"], "width": r["w"], "height": r["h"]}
-            shot = self._mss.grab(box)
-            return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
 
 
 # --------------------------------------------------------------------------
@@ -509,7 +356,11 @@ class Speaker:
         self._paused = False
 
         if engine == "espeak":
-            check_dependency("espeak-ng", "espeak-ng")
+            check_dependency(
+                "espeak-ng",
+                "Install it with:  sudo apt install espeak-ng   (Linux), or download the installer "
+                "from https://github.com/espeak-ng/espeak-ng/releases   (Windows)",
+            )
             self.rate = rate
             self.voice = voice
         elif engine == "piper":
@@ -522,7 +373,7 @@ class Speaker:
             # could silently find a different, incompatible `piper`
             # elsewhere on the system instead of the one actually installed
             # for this project.
-            venv_piper = Path(sys.executable).parent / "piper"
+            venv_piper = Path(sys.executable).parent / exe_name("piper")
             self.piper_bin = str(venv_piper) if venv_piper.exists() else shutil.which("piper")
             if self.piper_bin is None:
                 sys.exit(
@@ -536,21 +387,7 @@ class Speaker:
             self.piper_model = Path(piper_model)
             if not self.piper_model.exists():
                 sys.exit(f"Piper voice model not found: {self.piper_model}")
-            self.player_cmd_base = shutil.which("paplay")
-            if not self.player_cmd_base:
-                aplay = shutil.which("aplay")
-                if not aplay:
-                    sys.exit("Need 'paplay' or 'aplay' to play Piper's audio. Install with: sudo apt install alsa-utils")
-                self.player_cmd_base = aplay
-                self.log(
-                    f"Note: using aplay ({aplay}) to play Piper's audio — paplay isn't installed. "
-                    f"aplay talks to ALSA directly rather than through PulseAudio/PipeWire, which on some "
-                    f"systems means it 'succeeds' silently without any audible output (wrong/dummy default "
-                    f"device) even though nothing errors. If Piper stays silent with no error here, try "
-                    f"`sudo apt install pulseaudio-utils` for paplay instead."
-                )
-            else:
-                self.log(f"Piper audio playback: {self.player_cmd_base}")
+            PLATFORM.resolve_player("Piper", log=self.log)
 
             self.piper_length_scale = piper_length_scale
 
@@ -585,21 +422,7 @@ class Speaker:
             if not kokoro_voices_path.exists():
                 sys.exit(f"Kokoro voices file not found: {kokoro_voices_path}")
 
-            self.player_cmd_base = shutil.which("paplay")
-            if not self.player_cmd_base:
-                aplay = shutil.which("aplay")
-                if not aplay:
-                    sys.exit("Need 'paplay' or 'aplay' to play Kokoro's audio. Install with: sudo apt install alsa-utils")
-                self.player_cmd_base = aplay
-                self.log(
-                    f"Note: using aplay ({aplay}) to play Kokoro's audio — paplay isn't installed. "
-                    f"aplay talks to ALSA directly rather than through PulseAudio/PipeWire, which on some "
-                    f"systems means it 'succeeds' silently without any audible output (wrong/dummy default "
-                    f"device) even though nothing errors. If Kokoro stays silent with no error here, try "
-                    f"`sudo apt install pulseaudio-utils` for paplay instead."
-                )
-            else:
-                self.log(f"Kokoro audio playback: {self.player_cmd_base}")
+            PLATFORM.resolve_player("Kokoro", log=self.log)
 
             self.log(f"Loading Kokoro model ({kokoro_model_path.name})... this can take a few seconds the first time.")
             session = None
@@ -690,10 +513,11 @@ class Speaker:
             self._say_kokoro(text)
 
     def set_paused(self, paused: bool):
-        """Called by the pause hotkey (see PauseHotkey/on_pause_toggle in
-        run()). Setting this to True makes any say() call already in
-        flight -- or one that lands moments later, mid-OCR -- refuse to
-        start anything new, then stops whatever's currently playing. This
+        """Called by the pause hotkey (see platform_adapter.HotkeyWatcher
+        and on_pause_toggle in run()). Setting this to True makes any
+        say() call already in flight -- or one that lands moments later,
+        mid-OCR -- refuse to start anything new, then stops whatever's
+        currently playing. This
         is what makes pause behave like stop instead of merely stopping
         *current* playback and hoping nothing new sneaks in behind it."""
         with self._pause_lock:
@@ -714,16 +538,7 @@ class Speaker:
         self._proc.stdin.close()
 
         rate = self._piper_config().get("audio", {}).get("sample_rate", 22050)
-        if "paplay" in self.player_cmd_base:
-            play_cmd = [self.player_cmd_base, "--raw", f"--rate={rate}", "--format=s16le", "--channels=1"]
-        else:
-            play_cmd = [self.player_cmd_base, "-q", "-r", str(rate), "-f", "S16_LE", "-t", "raw", "-c", "1", "-"]
-        self._player_proc = subprocess.Popen(play_cmd, stdin=self._proc.stdout, stderr=subprocess.PIPE)
-
-    def _kokoro_play_cmd(self, sample_rate) -> list:
-        if "paplay" in self.player_cmd_base:
-            return [self.player_cmd_base, "--raw", f"--rate={sample_rate}", "--format=s16le", "--channels=1"]
-        return [self.player_cmd_base, "-q", "-r", str(sample_rate), "-f", "S16_LE", "-t", "raw", "-c", "1", "-"]
+        self._player_proc = PLATFORM.open_piped_player(self._proc.stdout, rate)
 
     def _say_kokoro(self, text: str):
         # Kokoro's synthesis is a blocking, CPU-bound call, unlike
@@ -765,20 +580,17 @@ class Speaker:
                 return  # superseded while synthesizing -- drop it
 
         pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes()
-        proc = subprocess.Popen(self._kokoro_play_cmd(sample_rate), stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        player = PLATFORM.open_pcm_player(sample_rate)
         with self._utterance_lock:
             if my_id != self._utterance_id:
                 # Went stale in the gap between the check above and actually
                 # starting playback -- kill it before it plays over whatever
                 # superseded it.
-                proc.terminate()
+                player.terminate()
                 return
-            self._player_proc = proc
-        try:
-            proc.stdin.write(pcm)
-            proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
+            self._player_proc = player
+        player.write(pcm)
+        player.close_stdin()
 
     def _say_kokoro_streaming_worker(self, text: str, my_id: int):
         """Uses kokoro-onnx's create_stream() to synthesize and play a line
@@ -797,7 +609,7 @@ class Speaker:
     async def _stream_kokoro_chunks(self, text: str, my_id: int):
         import numpy as np
 
-        proc = None
+        player = None
         try:
             stream = self._kokoro.create_stream(
                 text, voice=self.kokoro_voice, speed=self.kokoro_speed, lang=self.kokoro_lang,
@@ -806,25 +618,18 @@ class Speaker:
                 with self._utterance_lock:
                     if my_id != self._utterance_id:
                         return  # superseded -- stop pulling/playing further chunks immediately
-                if proc is None:
-                    proc = subprocess.Popen(self._kokoro_play_cmd(sample_rate),
-                                             stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                if player is None:
+                    player = PLATFORM.open_pcm_player(sample_rate)
                     with self._utterance_lock:
                         if my_id != self._utterance_id:
-                            proc.terminate()
+                            player.terminate()
                             return
-                        self._player_proc = proc
+                        self._player_proc = player
                 pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes()
-                try:
-                    proc.stdin.write(pcm)
-                except (BrokenPipeError, OSError):
-                    return
+                player.write(pcm)
         finally:
-            if proc is not None:
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
+            if player is not None:
+                player.close_stdin()
 
     def _piper_config(self) -> dict:
         cfg_path = Path(str(self.piper_model) + ".json")
@@ -843,22 +648,38 @@ class Speaker:
         stderr output."""
         if proc is None or proc.poll() is None or proc.returncode == 0:
             return
-        if proc.returncode == -15:
-            # -15 means "killed by SIGTERM" — and the only thing in this
-            # script that ever sends a process a signal is the .terminate()
-            # call a few lines down in _stop_current() itself. So this is
-            # never a real failure: it's this same method, on some earlier
-            # call, having intentionally cut off speech that was still
-            # playing (new dialogue interrupting old, or the pause hotkey
-            # stopping mid-sentence) — surfacing it as an "exited with
-            # code -15" error would just be misreporting our own doing.
+        if proc.returncode == -15 or (sys.platform == "win32" and proc.returncode == 1):
+            # -15 means "killed by SIGTERM" on Linux; subprocess.Popen.terminate()
+            # on Windows has no signal concept and always exits real
+            # subprocesses with code 1 instead. Either way, the only thing
+            # in this script that ever kills one of these processes is the
+            # .terminate() call a few lines down in _stop_current() itself
+            # (real Popens for espeak-ng/Piper/piped playback, and
+            # _SoundDevicePcmPlayer self-reports 0 on intentional shutdown
+            # rather than reaching this branch at all). So this is never a
+            # real failure: it's this same method, on some earlier call,
+            # having intentionally cut off speech that was still playing
+            # (new dialogue interrupting old, or the pause hotkey stopping
+            # mid-sentence) — surfacing it as an error would just be
+            # misreporting our own doing. NOTE: a genuine Piper/espeak-ng
+            # crash on Windows that happens to also exit with code 1 would
+            # be masked by this same check -- an acceptable trade-off here,
+            # same as it already is for -15 on Linux.
             return
-        stderr_text = ""
-        try:
-            if proc.stderr:
-                stderr_text = proc.stderr.read().decode("utf-8", errors="replace").strip()
-        except Exception:
-            pass
+        # self._proc is always a real subprocess.Popen (espeak-ng/piper);
+        # self._player_proc may instead be a platform_adapter.PcmPlayer
+        # (Kokoro always, Piper via open_piped_player()) -- read_stderr()
+        # is how a PcmPlayer surfaces error text since it may not have a
+        # real subprocess .stderr to read from (see _SoundDevicePcmPlayer).
+        if hasattr(proc, "read_stderr"):
+            stderr_text = proc.read_stderr()
+        else:
+            stderr_text = ""
+            try:
+                if proc.stderr:
+                    stderr_text = proc.stderr.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
         msg = f"[speech] {label} exited with code {proc.returncode}"
         if stderr_text:
             msg += f": {stderr_text}"
@@ -903,183 +724,6 @@ def _interruptible_sleep(seconds: float, stop_event) -> None:
         elapsed += chunk
 
 
-# --------------------------------------------------------------------------
-# Global pause hotkey
-# --------------------------------------------------------------------------
-
-# A few friendlier spellings for common evdev key names.
-_KEY_NAME_ALIASES = {
-    "space": "KEY_SPACE",
-    "spacebar": "KEY_SPACE",
-    "scrolllock": "KEY_SCROLLLOCK",
-    "scroll_lock": "KEY_SCROLLLOCK",
-    "scroll-lock": "KEY_SCROLLLOCK",
-    "pause": "KEY_PAUSE",
-    "break": "KEY_PAUSE",
-}
-
-
-class PauseHotkey:
-    """Listens for a key press anywhere on the system — not just while this
-    app's own window has focus — and calls `on_toggle()` each time it's
-    pressed, so the narrator can be paused/resumed while a fullscreen game
-    has keyboard focus instead of this app.
-
-    This reads raw keyboard events straight from the kernel (/dev/input)
-    via the 'evdev' package, rather than through a display-server-level
-    "global hotkey" hook: those typically only work under X11 and silently
-    do nothing under Wayland, which is exactly the split this project
-    already has to handle for screen capture (see is_wayland() above).
-    Reading straight from the kernel works under either.
-
-    Deliberately does NOT grab() the input device exclusively — it only
-    *observes* key events alongside however the game/desktop already
-    handles them. That means pressing the pause key still does whatever it
-    always did in the game (e.g. advance dialogue) *in addition to*
-    pausing/resuming the narrator — see README for why, and how to pick a
-    key that avoids stepping on something the game already uses.
-
-    Gracefully disables itself (logs a note, leaves `self.available =
-    False`) rather than raising, if evdev isn't installed, the requested
-    key name isn't recognized, or /dev/input isn't readable (usually a
-    permissions issue — see README).
-    """
-
-    def __init__(self, key_name: str, on_toggle, log=print):
-        self.log = log
-        self.on_toggle = on_toggle
-        self.key_name = key_name
-        self.available = False
-        self.key_code = None
-        self._stop = threading.Event()
-        self._thread = None
-        self._devices = []
-
-        try:
-            import evdev  # noqa: F401
-        except ImportError:
-            self.log(
-                f"Note: pause hotkey ('{key_name}') disabled — the 'evdev' package isn't installed. "
-                f"Install it with: pip install evdev   (inside your venv — see README)."
-            )
-            return
-
-        from evdev import ecodes
-        attr_name = _KEY_NAME_ALIASES.get(key_name.strip().lower(), f"KEY_{key_name.strip().upper()}")
-        self.key_code = getattr(ecodes, attr_name, None)
-        if self.key_code is None:
-            self.log(
-                f"Note: pause hotkey disabled — '{key_name}' isn't a recognized key name "
-                f"(try 'space', 'f9', 'scrolllock', ...)."
-            )
-            return
-
-        self._devices = self._find_devices()
-        if self._devices:
-            self.available = True
-
-    def _find_devices(self):
-        # Enumerate /dev/input/event* ourselves via glob rather than relying
-        # on evdev.list_devices() — on at least one real setup that function
-        # came back empty even though the device files were plainly present
-        # and listable by the same user in a shell, for reasons that were
-        # never pinned down. Doing the same glob() evdev does internally,
-        # directly, sidesteps whatever that mismatch was.
-        from evdev import InputDevice, ecodes
-
-        paths = sorted(glob.glob("/dev/input/event*"))
-        if not paths:
-            try:
-                raw_listing = sorted(os.listdir("/dev/input"))
-            except Exception as e:
-                raw_listing = [f"<couldn't list /dev/input: {e}>"]
-            self.log(
-                "Note: pause hotkey disabled — no /dev/input/event* device files found. "
-                f"Raw listing of /dev/input: {raw_listing!r}. If `ls /dev/input` in a terminal shows "
-                "event devices when this doesn't, something about how this process is launched is "
-                "hiding /dev/input from it (a sandboxed/containerized launch, an unusual .desktop "
-                "setup, etc.) — running from a normal terminal is the way to rule that in or out."
-            )
-            return []
-
-        opened = []
-        permission_denied = []
-        for path in paths:
-            try:
-                opened.append(InputDevice(path))
-            except PermissionError:
-                permission_denied.append(path)
-            except OSError:
-                continue
-        if not opened:
-            self.log(
-                f"Note: pause hotkey disabled — found {len(paths)} input device(s) "
-                f"({', '.join(paths)}) but couldn't open any of them ({len(permission_denied)} "
-                f"permission denied). Add yourself to the 'input' group with "
-                f"`sudo usermod -aG input $USER`, then log all the way out and back in (see README)."
-            )
-            return []
-
-        matching = [d for d in opened if self.key_code in d.capabilities().get(ecodes.EV_KEY, [])]
-        for d in opened:
-            if d not in matching:
-                try:
-                    d.close()
-                except Exception:
-                    pass
-        if not matching:
-            self.log(
-                f"Note: pause hotkey disabled — opened {len(opened)} input device(s) "
-                f"({', '.join(d.path for d in opened)}) but none report a '{self.key_name}' key."
-            )
-        return matching
-
-    def start(self):
-        if not self.available:
-            return
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=1.0)
-        for dev in self._devices:
-            try:
-                dev.close()
-            except Exception:
-                pass
-
-    def _run(self):
-        import selectors
-        from evdev import ecodes
-        sel = selectors.DefaultSelector()
-        try:
-            registered = 0
-            for dev in self._devices:
-                try:
-                    sel.register(dev, selectors.EVENT_READ)
-                    registered += 1
-                except Exception as e:
-                    self.log(f"[hotkey] couldn't watch {getattr(dev, 'path', dev)}: {e}")
-            if not registered:
-                self.log("[hotkey] no input devices could be watched — pause hotkey is inactive.")
-                return
-            while not self._stop.is_set():
-                for key, _ in sel.select(timeout=0.5):
-                    dev = key.fileobj
-                    try:
-                        for event in dev.read():
-                            if event.type == ecodes.EV_KEY and event.code == self.key_code and event.value == 1:
-                                self.on_toggle()
-                    except (OSError, BlockingIOError):
-                        continue
-        except Exception as e:
-            self.log(f"[hotkey] listener stopped unexpectedly: {e}")
-        finally:
-            sel.close()
-
-
 def run(args, stop_event=None, log=print, on_pause_change=None):
     """Runs the OCR -> speech loop until Ctrl+C (CLI) or stop_event is set
     (GUI, from a Stop button on another thread). `log` receives each status
@@ -1094,7 +738,7 @@ def run(args, stop_event=None, log=print, on_pause_change=None):
             sys.exit("--ignore-popups needs a saved marker. Run with --select-popup-marker first.")
 
     region = load_region()
-    capturer = ScreenCapturer(region)
+    capturer = PLATFORM.make_capturer(region)
     speaker = None if args.quiet else Speaker(
         engine=args.engine, rate=args.rate, voice=args.voice, piper_model=args.piper_model,
         piper_speaker=getattr(args, "piper_speaker", None),
@@ -1154,7 +798,7 @@ def run(args, stop_event=None, log=print, on_pause_change=None):
         last_text = ""
 
     pause_key = (getattr(args, "pause_key", "space") or "").strip()
-    hotkey = PauseHotkey(pause_key, on_pause_toggle, log=log) if pause_key else None
+    hotkey = PLATFORM.make_hotkey_watcher(pause_key, on_pause_toggle, log=log) if pause_key else None
     if hotkey:
         hotkey.start()
         if hotkey.available:
@@ -1260,14 +904,16 @@ def main():
     parser.add_argument("--cpu-affinity", default="", metavar="CORE,CORE,...",
                          help="Pin this whole process to specific CPU cores, e.g. '4,5,6,7' -- reserves "
                               "uncontended CPU time for OCR + speech instead of leaving the OS to time-share "
-                              "it with a demanding game on every core. Linux only. Default: unset (no pinning).")
+                              "it with a demanding game on every core. Works on Linux and Windows (the latter "
+                              "needs 'pip install psutil'); a no-op elsewhere. Default: unset (no pinning).")
     parser.add_argument("--similarity", type=float, default=0.92,
                          help="0-1 threshold above which new text is treated as 'unchanged' and not re-spoken (default 0.92).")
     parser.add_argument("--pause-key", default="space", metavar="KEY",
                          help="Key that pauses/resumes the narrator from anywhere, even while the game has "
                               "keyboard focus (e.g. 'space', 'f9', 'scrolllock'). Empty string disables the "
-                              "hotkey entirely. Needs the 'evdev' package and read access to /dev/input "
-                              "(see README) — degrades gracefully with a log note if unavailable.")
+                              "hotkey entirely. Needs the 'evdev' package and read access to /dev/input on "
+                              "Linux, or the 'keyboard' package on Windows (see README) — degrades "
+                              "gracefully with a log note if unavailable.")
     parser.add_argument("--quiet", action="store_true", help="Print recognized text but don't speak it.")
     args = parser.parse_args()
 

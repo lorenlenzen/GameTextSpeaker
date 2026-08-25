@@ -22,3 +22,13 @@ gui_settings.json
 voices/**/*.onnx
 voices/**/*.onnx.json
 voices/**/*.bin
+
+# PyInstaller build output (build_windows.py) -- the whole point of that
+# script is that everyone builds their own .exe from source rather than
+# one being committed or shipped in the repo. build/ is PyInstaller's
+# scratch work area; dist/ is where the finished app actually ends up.
+# The .spec file is auto-generated fresh by build_windows.py every run,
+# so it doesn't need to be tracked either.
+build/
+dist/
+game-text-speaker.spec
