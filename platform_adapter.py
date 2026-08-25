@@ -302,42 +302,68 @@ class _SoundDevicePcmPlayer(PcmPlayer):
     def __init__(self, sample_rate: int, channels: int = 1):
         import sounddevice as sd
 
+        # Guards every touch of self._stream. write() runs on whichever
+        # background synthesis thread is currently playing (Kokoro/Piper/
+        # SAPI5's own worker thread -- see game_text_speaker.py), while
+        # terminate() runs on a DIFFERENT thread entirely: the pause hotkey
+        # (or a new line of dialogue superseding this one) calls
+        # Speaker._stop_current(), which calls this object's terminate()
+        # straight away, with no way to know whether a write() call happens
+        # to be in progress on the stream at that exact moment. Without this
+        # lock, terminate()'s stream.abort()/close() can run concurrently
+        # with a write() already in flight on the other thread -- calling
+        # into the same PortAudio stream from two threads at once like that
+        # is undefined behavior at the native/C level, and doesn't raise a
+        # catchable Python exception when it goes wrong: it can crash the
+        # whole process outright (this is what "pausing works, unpausing
+        # closes the entire app" turned out to be -- resuming immediately
+        # re-speaks the current line, which is exactly when a fresh write()
+        # from the new utterance's worker thread is most likely to be
+        # racing a terminate() from the line that was just cut off). The
+        # trade-off: terminate() now waits for whatever single write() call
+        # is currently in progress to return before it can abort -- a short,
+        # bounded delay (one chunk's worth of audio) instead of an
+        # unbounded crash.
+        self._lock = threading.Lock()
         self._stream = sd.RawOutputStream(samplerate=sample_rate, channels=channels, dtype="int16")
         self._stream.start()
         self._error = None
         self._closed = False
 
     def write(self, data: bytes) -> None:
-        if self._closed:
-            return
-        try:
-            self._stream.write(data)
-        except Exception as e:
-            self._error = str(e)
+        with self._lock:
+            if self._closed:
+                return
+            try:
+                self._stream.write(data)
+            except Exception as e:
+                self._error = str(e)
 
     def close_stdin(self) -> None:
         pass  # nothing to close -- terminate()/going idle ends the stream
 
     def poll(self):
-        if self._error is not None:
-            return 1
-        if self._closed or not self._stream.active:
-            return 0
-        return None
+        with self._lock:
+            if self._error is not None:
+                return 1
+            if self._closed or not self._stream.active:
+                return 0
+            return None
 
     @property
     def returncode(self):
         return self.poll()
 
     def terminate(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self._stream.abort()  # stop immediately, discarding anything buffered
-            self._stream.close()
-        except Exception:
-            pass
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._stream.abort()  # stop immediately, discarding anything buffered
+                self._stream.close()
+            except Exception:
+                pass
 
     def read_stderr(self) -> str:
         return self._error or ""
