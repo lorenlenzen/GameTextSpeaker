@@ -448,11 +448,28 @@ def _build_exe(onefile: bool, log=print) -> bool:
         log(f"\nPyInstaller exited with code {proc.returncode} -- see the output above for why.")
         return False
 
-    log(
-        "\nBuilt. The standalone app is in dist\\game-text-speaker\\ -- game-text-speaker.exe in there "
-        "runs without needing Python installed.\nTesseract and espeak-ng (if you're using either) still "
-        "need to be installed separately and on PATH -- see the (?) notes above."
-    )
+    # onefile and onedir put the finished .exe in genuinely different
+    # places -- onedir COLLECTs everything into dist\game-text-speaker\
+    # with game-text-speaker.exe inside it, while onefile's EXE() writes a
+    # single game-text-speaker.exe straight into dist\ itself, no subfolder
+    # at all. Reporting the wrong one of these isn't just a cosmetic typo:
+    # someone who checked "Single-file .exe" and then goes looking in
+    # dist\game-text-speaker\ (per the onedir wording) finds either nothing
+    # or a stale exe left over from an earlier onedir build, which looks
+    # exactly like "the build didn't work" even though it did.
+    if onefile:
+        log(
+            "\nBuilt. The standalone app is dist\\game-text-speaker.exe -- a single file that runs "
+            "without needing Python installed (no dist\\game-text-speaker\\ folder this time -- that's "
+            "only for the non-single-file build).\nTesseract and espeak-ng (if you're using either) "
+            "still need to be installed separately and on PATH -- see the (?) notes above."
+        )
+    else:
+        log(
+            "\nBuilt. The standalone app is in dist\\game-text-speaker\\ -- game-text-speaker.exe in there "
+            "runs without needing Python installed.\nTesseract and espeak-ng (if you're using either) still "
+            "need to be installed separately and on PATH -- see the (?) notes above."
+        )
     return True
 
 
@@ -540,6 +557,22 @@ class SetupApp:
                 text="Single-file .exe (slower to start each time; easier to hand to someone as one file)",
                 variable=self.onefile_var,
             ).pack(anchor="w", padx=6)
+
+            # Checking "Single-file .exe" on its own reads like a complete
+            # request -- "I want a single-file build" -- but it's really
+            # just a modifier for the checkbox above: _on_install() only
+            # builds anything at all when build_exe_var is checked, and
+            # onefile_var only matters when it is. Checking only this one
+            # used to silently install packages and build NOTHING, no
+            # warning, nothing in dist\ -- exactly what happened here. This
+            # makes the dependency visible instead of a trap: checking
+            # Single-file also checks (and shows checked) the box that
+            # actually triggers a build.
+            def _onefile_implies_build(*_args):
+                if self.onefile_var.get():
+                    self.build_exe_var.set(True)
+
+            self.onefile_var.trace_add("write", _onefile_implies_build)
             ttk.Label(
                 build_frame,
                 text="Bundles whatever else is checked above -- so check everything you want included "
@@ -612,8 +645,13 @@ class SetupApp:
 
         # Read these on the main thread (Tkinter variables) before handing
         # off to the worker -- same reasoning as `checked`/`packages` above.
-        build_exe = sys.platform == "win32" and self.build_exe_var.get()
-        onefile = self.onefile_var.get() if build_exe else False
+        # Checking either box means "build me something" -- the
+        # onefile_var trace in _build_ui already keeps build_exe_var
+        # checked in lockstep whenever onefile_var is, but this `or` is a
+        # second, independent guarantee that checking Single-file alone
+        # can never again silently build nothing.
+        onefile = sys.platform == "win32" and self.onefile_var.get()
+        build_exe = sys.platform == "win32" and (self.build_exe_var.get() or self.onefile_var.get())
 
         self.install_button.config(state="disabled")
 
@@ -660,9 +698,13 @@ class SetupApp:
                             ok = False
                     if ok and _check_pythoncom(log=self._log):
                         try:
-                            _build_exe(onefile=onefile, log=self._log)
+                            if not _build_exe(onefile=onefile, log=self._log):
+                                self._log(
+                                    "\n*** .exe build FAILED -- see the PyInstaller output above for "
+                                    "why. Nothing was written to dist\\. ***"
+                                )
                         except Exception as e:
-                            self._log(f"Build failed: {e}")
+                            self._log(f"\n*** .exe build FAILED: {e} ***")
 
             self._log("\nYou can now run:  python gui.py" if sys.platform == "win32" else
                        "\nYou can now run:  python3 gui.py")

@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -291,79 +292,255 @@ class _SoundDevicePcmPlayer(PcmPlayer):
     direct writes (Kokoro's chunks) and, via the reader thread started by
     WindowsAdapter.open_piped_player(), for Piper's piped stdout.
 
-    UNTESTED on real Windows hardware — this project is developed on
-    Linux. sounddevice.RawOutputStream.write() blocks until there's buffer
-    room, the same way writing to a subprocess's stdin pipe blocks when the
-    OS pipe fills up, so it should be a drop-in behavioral match — but if
-    Piper/Kokoro audio stutters, cuts out, or errors on Windows, this class
-    is the first place to look.
+    sounddevice.RawOutputStream.write() blocks until there's buffer room,
+    the same way writing to a subprocess's stdin pipe blocks when the OS
+    pipe fills up, which is what makes it a drop-in match for the
+    aplay/paplay subprocess Linux uses. If Piper/Kokoro audio stutters,
+    cuts out, or errors on Windows, this class is the first place to look.
+
+    THREADING RULE, and why this class is shaped the way it is
+    ----------------------------------------------------------
+    Exactly ONE thread — the "owner", the one that writes audio — is ever
+    allowed to call into self._stream. No other thread touches it, for any
+    reason, ever. Not to close it, not even to ask whether it's still
+    playing. There is deliberately no lock here, because there is nothing
+    to lock: no two threads ever reach the native layer at once.
+
+    That rule exists because breaking it crashed the whole app, and it's
+    worth writing down exactly how, since "add a lock" looks like the
+    obvious fix and is the wrong one.
+
+    sounddevice's Stream.close() is, underneath, this:
+
+        err = _lib.Pa_CloseStream(self._ptr)
+        self._ptr = _ffi.NULL
+
+    Pa_CloseStream frees the native stream object. Meanwhile a write() on
+    another thread is sitting inside Pa_WriteStream(self._ptr, ...) — it
+    read that same pointer moments earlier and is still dereferencing it.
+    So close() frees the stream out from under an in-flight write: a
+    textbook use-after-free. At the C level that's not an exception, it's
+    an access violation, which is why the symptom was "the whole Python
+    process vanishes from the taskbar" with no traceback in the log.
+
+    Pause is where this bit, because pause is the one moment those two
+    calls are guaranteed to be simultaneous: the hotkey thread calls
+    Speaker._stop_current() -> terminate() -> close(), while the synthesis
+    worker for the line being cut off is mid-write(). Resuming then
+    re-speaks the line, starting a fresh write() at exactly the moment the
+    previous terminate() is landing — which is why "pause seemed fine, it
+    was UNpausing that killed it".
+
+    A lock does prevent the crash, but it makes terminate() wait for the
+    in-flight write() to finish, and a write() here can legitimately take
+    seconds (see the chunking in write() below). Making the pause hotkey's
+    own thread wait seconds is bad on its own; on Windows it's worse,
+    because that thread belongs to the 'keyboard' package's low-level hook
+    and stalling it stalls keyboard event processing system-wide. Hence:
+    no lock, one owner thread, terminate() makes no native calls at all.
     """
 
-    def __init__(self, sample_rate: int, channels: int = 1):
-        import sounddevice as sd
+    # Feed the device in slices this long rather than handing it a whole
+    # utterance in one call. Two reasons, both of which were real bugs:
+    #
+    #   1. Responsiveness. Kokoro's create_stream() yields a chunk per
+    #      sentence, and Piper hands over whole phrases -- a single
+    #      write() of that could block for seconds inside PortAudio. Since
+    #      pause is now cooperative (terminate() sets a flag; the owner
+    #      thread acts on it), the flag can only be noticed between native
+    #      calls, so the slice length IS the worst-case pause latency.
+    #      50ms is imperceptible to a person and still a big buffer.
+    #   2. It bounds how long any single native call holds the stream,
+    #      which is what makes the "one owner thread" rule cheap to honor.
+    _SLICE_SECONDS = 0.05
 
-        # Guards every touch of self._stream. write() runs on whichever
-        # background synthesis thread is currently playing (Kokoro/Piper/
-        # SAPI5's own worker thread -- see game_text_speaker.py), while
-        # terminate() runs on a DIFFERENT thread entirely: the pause hotkey
-        # (or a new line of dialogue superseding this one) calls
-        # Speaker._stop_current(), which calls this object's terminate()
-        # straight away, with no way to know whether a write() call happens
-        # to be in progress on the stream at that exact moment. Without this
-        # lock, terminate()'s stream.abort()/close() can run concurrently
-        # with a write() already in flight on the other thread -- calling
-        # into the same PortAudio stream from two threads at once like that
-        # is undefined behavior at the native/C level, and doesn't raise a
-        # catchable Python exception when it goes wrong: it can crash the
-        # whole process outright (this is what "pausing works, unpausing
-        # closes the entire app" turned out to be -- resuming immediately
-        # re-speaks the current line, which is exactly when a fresh write()
-        # from the new utterance's worker thread is most likely to be
-        # racing a terminate() from the line that was just cut off). The
-        # trade-off: terminate() now waits for whatever single write() call
-        # is currently in progress to return before it can abort -- a short,
-        # bounded delay (one chunk's worth of audio) instead of an
-        # unbounded crash.
-        self._lock = threading.Lock()
-        self._stream = sd.RawOutputStream(samplerate=sample_rate, channels=channels, dtype="int16")
-        self._stream.start()
+    def __init__(self, sample_rate: int, channels: int = 1, owner_ident=None):
+        # See the THREADING RULE above. `owner_ident` is the thread allowed
+        # to make native calls: open_pcm_player() passes its own caller
+        # (the synthesis worker, which then does the writing itself), while
+        # open_piped_player() passes None because the writing is done by a
+        # pump thread that doesn't exist yet -- that thread claims
+        # ownership on its first write() instead.
+        self._owner_ident = owner_ident
+        self._sample_rate = sample_rate
+        self._channels = channels
+        self._slice_bytes = max(1, int(sample_rate * self._SLICE_SECONDS)) * channels * 2  # int16
+
+        # Note what is NOT happening here: the PortAudio stream is not
+        # opened. It's opened lazily, by _ensure_stream() below, on the
+        # first write -- because that's the first moment we know which
+        # thread the owner actually is. Opening it here would mean
+        # open_piped_player()'s caller opens and starts a stream that a
+        # different thread (the pump) then writes to, which breaks the
+        # one-thread rule this class depends on.
+        self._stream = None
         self._error = None
-        self._closed = False
+        self._stopping = False   # set by terminate(), from any thread
+        self._finishing = False  # owner thread is inside _finish() (re-entrancy guard)
+        self._done = False       # stream is closed and silent; nothing left to stop
+
+    def _claim(self) -> bool:
+        """Note this thread as the owner if nobody has claimed it yet, and
+        report whether the calling thread is the owner."""
+        if self._owner_ident is None:
+            self._owner_ident = threading.get_ident()
+        return self._owner_ident == threading.get_ident()
+
+    def _ensure_stream(self) -> bool:
+        """Open and start the stream if it isn't already. Only ever called
+        on the owner thread. Returns False if the device couldn't be
+        opened, in which case the reason is left in self._error for
+        Speaker._check_finished() to log."""
+        if self._stream is not None:
+            return True
+        try:
+            import sounddevice as sd
+
+            # latency="high" asks PortAudio for generous device buffers.
+            # This is a narrator reading dialogue, not a synth -- nobody
+            # can tell that audio starts a fraction later, and bigger
+            # buffers mean the audio callback fires far less often, which
+            # is free CPU back.
+            self._stream = sd.RawOutputStream(
+                samplerate=self._sample_rate, channels=self._channels,
+                dtype="int16", latency="high",
+            )
+            self._stream.start()
+            return True
+        except Exception as e:
+            # start() can fail on a stream that opened fine (device grabbed
+            # exclusively or unplugged in between). sounddevice has no
+            # __del__ and doesn't ffi.gc the pointer, so just dropping the
+            # reference would leak the open native stream for the life of
+            # the process -- and on Windows a leaked open output stream can
+            # keep the endpoint busy, making every later line fail to open
+            # too. Close it explicitly before letting go.
+            try:
+                if self._stream is not None:
+                    self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+            self._error = f"couldn't open audio output: {e}"
+            return False
 
     def write(self, data: bytes) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            try:
-                self._stream.write(data)
-            except Exception as e:
-                self._error = str(e)
+        if not self._claim():
+            # Unreachable today, and the THREADING RULE above is what keeps
+            # it that way -- but if a second thread ever did start writing
+            # here, dropping its audio is a far better failure than the
+            # native crash that made this class get rewritten.
+            return
+        if self._done or self._finishing:
+            return
+        if not self._stopping and not self._ensure_stream():
+            return
+        try:
+            if not self._stopping:
+                buf = memoryview(data).cast("B")
+                for offset in range(0, len(buf), self._slice_bytes):
+                    if self._stopping:  # pause/new line landed -- drop the rest
+                        break
+                    self._stream.write(buf[offset:offset + self._slice_bytes])
+        except Exception as e:
+            self._error = str(e)
+        finally:
+            if self._stopping:
+                # We're the owner thread and we've just stopped writing, so
+                # we're the one that has to do the closing. Nobody else can.
+                self._finish(drain=False)
 
     def close_stdin(self) -> None:
-        pass  # nothing to close -- terminate()/going idle ends the stream
+        """The owner thread calling this means "that's the whole
+        utterance". Unlike a pipe, a PortAudio stream doesn't clean itself
+        up when the writing stops, so this is where the stream actually
+        gets closed -- previously this was a no-op, which left every
+        finished line's stream open and running until the NEXT line came
+        along to terminate it. Between lines (i.e. most of the time) that
+        was an idle output stream underflowing in the background, burning
+        CPU for nothing. espeak-ng never had this problem because it plays
+        through a real subprocess that simply exits."""
+        if self._claim():
+            self._finish(drain=not self._stopping)
+
+    def _finish(self, drain: bool) -> None:
+        """Actually stop and close the stream. ONLY ever called on the
+        owner thread — see the THREADING RULE above.
+
+        Note the two separate flags. `_finishing` is the re-entrancy guard
+        (this thread is already in here); `_done` means the stream is
+        closed and silent, and is only set at the very end. They have to be
+        distinct because the drain below takes real time and audio is still
+        playing throughout it: if poll() reported "finished" during the
+        drain, Speaker._stop_current()'s `if p.poll() is None` guard would
+        skip terminate(), so a pause landing mid-drain couldn't cut the
+        tail off, and the next line could open a second output stream on
+        top of this one still playing."""
+        if self._finishing or self._done:
+            return
+        self._finishing = True
+        if self._stream is None:
+            self._done = True  # never got as far as opening a device
+            return
+        try:
+            if drain:
+                # write() returns once the data is handed to the device
+                # buffer, not once it's audible, so closing immediately
+                # would clip the last fraction of a second off every line.
+                # Wait out roughly one buffer's worth -- in small slices,
+                # so a pause landing mid-drain still cuts the tail off
+                # instead of having to sit through it.
+                try:
+                    remaining = float(self._stream.latency)
+                except Exception:
+                    remaining = 0.2
+                deadline = time.monotonic() + min(remaining, 1.0) + 0.05
+                while time.monotonic() < deadline and not self._stopping:
+                    time.sleep(0.01)
+            self._stream.abort()  # discard anything still buffered
+            self._stream.close()
+        except Exception:
+            pass
+        finally:
+            self._done = True
 
     def poll(self):
-        with self._lock:
-            if self._error is not None:
-                return 1
-            if self._closed or not self._stream.active:
-                return 0
-            return None
+        # Deliberately flag-only. The obvious implementation asks the
+        # stream itself (`self._stream.active`), but poll() is called from
+        # Speaker._stop_current() on the main loop's thread -- a non-owner
+        # -- and that would be exactly the cross-thread native call this
+        # class exists to avoid. Worse, it would be reading self._ptr
+        # right when the owner thread might be closing the stream, which
+        # is the same use-after-free described above.
+        if self._error is not None:
+            # 2, not 1, deliberately: _check_finished() treats a returncode
+            # of 1 on Windows as "we terminated it ourselves" and stays
+            # quiet about it, so reporting a real playback failure as 1
+            # would swallow it and leave the user with unexplained silence.
+            return 2
+        if self._done or self._stopping:
+            return 0
+        return None
 
     @property
     def returncode(self):
         return self.poll()
 
     def terminate(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            try:
-                self._stream.abort()  # stop immediately, discarding anything buffered
-                self._stream.close()
-            except Exception:
-                pass
+        # Makes no native calls, takes no locks, and never blocks -- it
+        # just raises the flag and returns. The owner thread notices
+        # between slices (at most _SLICE_SECONDS later) and does the
+        # closing itself.
+        self._stopping = True
+
+        # ...with one exception, which is safe precisely because it isn't
+        # cross-thread: the "created a player, then found out the line was
+        # already superseded" paths in game_text_speaker.py terminate a
+        # player from the very thread that owns it, before any write() has
+        # happened. There's no writer to hand the job off to there, so if
+        # we didn't close it here that stream would leak.
+        if self._owner_ident == threading.get_ident():
+            self._finish(drain=False)
 
     def read_stderr(self) -> str:
         return self._error or ""
@@ -379,6 +556,11 @@ def _pump_stream_into_player(source_stream, player: PcmPlayer, chunk_size: int =
     sounddevice has no equivalent of "hand it a file descriptor"."""
     try:
         while True:
+            if player.poll() is not None:
+                # Paused, superseded, or errored -- stop pulling from the
+                # source instead of draining the rest of Piper's output
+                # into a player that's throwing it away.
+                break
             chunk = source_stream.read(chunk_size)
             if not chunk:
                 break
@@ -386,6 +568,13 @@ def _pump_stream_into_player(source_stream, player: PcmPlayer, chunk_size: int =
     except (BrokenPipeError, OSError, ValueError):
         pass
     finally:
+        # Close the source too: on the early break above we stop reading
+        # mid-stream, and leaving the pipe open would block the feeding
+        # subprocess forever once its stdout buffer fills.
+        try:
+            source_stream.close()
+        except Exception:
+            pass
         player.close_stdin()
 
 
@@ -813,9 +1002,15 @@ class WindowsAdapter(PlatformAdapter):
         return MssCapturer(region)
 
     def open_pcm_player(self, sample_rate: int, channels: int = 1) -> PcmPlayer:
-        return _SoundDevicePcmPlayer(sample_rate, channels)
+        # Whoever opens a direct player is also the thread that writes to
+        # it (see the synthesis workers in game_text_speaker.py), so it
+        # owns the stream -- see _SoundDevicePcmPlayer's THREADING RULE.
+        return _SoundDevicePcmPlayer(sample_rate, channels, owner_ident=threading.get_ident())
 
     def open_piped_player(self, source_stream, sample_rate: int, channels: int = 1) -> PcmPlayer:
+        # No owner_ident here: this thread only *creates* the player, the
+        # pump thread below is what writes to it. It claims ownership
+        # itself on its first write.
         player = _SoundDevicePcmPlayer(sample_rate, channels)
         threading.Thread(target=_pump_stream_into_player, args=(source_stream, player), daemon=True).start()
         return player
