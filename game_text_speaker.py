@@ -35,6 +35,8 @@ from pathlib import Path
 from platform_adapter import (
     get_platform_adapter, check_dependency, pick_region_from_image, subprocess_no_window_kwargs,
 )
+import game_profile
+from game_profile import Observation, split_speaker_name
 
 CONFIG_PATH = Path(__file__).with_name("region.json")
 POPUP_MARKER_PATH = Path(__file__).with_name("popup_marker.json")
@@ -266,6 +268,103 @@ def ocr_image(img, lang: str, min_confidence: int = 40, engine: str = "tesseract
     return clean_ocr_text(_ocr_image_tesseract(img, lang, min_confidence))
 
 
+def ocr_lines(img, lang: str, min_confidence: int = 40, engine: str = "tesseract") -> list:
+    """Where each recognized line of text SITS, not just what it says.
+
+    Returns [{"text", "x", "y", "w", "h"}, ...] with the geometry as
+    FRACTIONS of the image rather than pixels, so a profile written at one
+    resolution still describes the same layout at another.
+
+    This costs nothing extra: Tesseract's image_to_data() -- already what
+    _ocr_image_tesseract() calls, for the per-word confidence scores -- has
+    been returning per-word bounding boxes all along, and we were throwing
+    them away. That geometry is what lets the "margin" detector notice a
+    speaker name set apart from the body text without being told where to
+    look, which in turn is what makes speaker detection work in games whose
+    dialogue isn't quoted.
+
+    Returns [] rather than raising if the engine can't supply positions --
+    the detectors that need geometry simply don't fire, and the ones that
+    work on flat text carry on."""
+    try:
+        if engine == "windows":
+            return _ocr_lines_windows(img, lang)
+        return _ocr_lines_tesseract(img, lang, min_confidence)
+    except Exception:
+        return []
+
+
+def _ocr_lines_tesseract(img, lang: str, min_confidence: int) -> list:
+    import pytesseract
+    from pytesseract import Output
+
+    data = pytesseract.image_to_data(img, lang=lang, output_type=Output.DICT)
+    width, height = img.size
+    if not width or not height:
+        return []
+
+    grouped = {}
+    for i, word in enumerate(data.get("text", [])):
+        word = word.strip()
+        if not word:
+            continue
+        try:
+            if int(data["conf"][i]) < min_confidence:
+                continue
+        except (ValueError, TypeError, KeyError):
+            continue
+        # block/paragraph/line together are Tesseract's own idea of "same
+        # line", which is more reliable than clustering by y ourselves.
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        left, top = data["left"][i], data["top"][i]
+        right, bottom = left + data["width"][i], top + data["height"][i]
+        entry = grouped.get(key)
+        if entry is None:
+            grouped[key] = {"words": [word], "l": left, "t": top, "r": right, "b": bottom}
+        else:
+            entry["words"].append(word)
+            entry["l"] = min(entry["l"], left)
+            entry["t"] = min(entry["t"], top)
+            entry["r"] = max(entry["r"], right)
+            entry["b"] = max(entry["b"], bottom)
+
+    lines = []
+    for entry in grouped.values():
+        lines.append({
+            "text": clean_ocr_text(" ".join(entry["words"])),
+            "x": entry["l"] / width, "y": entry["t"] / height,
+            "w": (entry["r"] - entry["l"]) / width,
+            "h": (entry["b"] - entry["t"]) / height,
+        })
+    return sorted(lines, key=lambda l: l["y"])
+
+
+def _ocr_lines_windows(img, lang: str) -> list:
+    """Windows' OCR API reports a bounding rect per line too. Read
+    defensively -- winocr's dict shape has moved around between versions,
+    and losing geometry should degrade the detectors, not break OCR."""
+    import winocr
+
+    result = winocr.recognize_pil_sync(img, lang)
+    width, height = img.size
+    if not width or not height:
+        return []
+    lines = []
+    for line in (result.get("lines") or []):
+        text = (line.get("text") or "").strip()
+        if not text:
+            continue
+        rect = line.get("bounding_rect") or line.get("boundingRect") or {}
+        try:
+            x, y = float(rect["x"]), float(rect["y"])
+            w, h = float(rect["width"]), float(rect["height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        lines.append({"text": clean_ocr_text(text), "x": x / width, "y": y / height,
+                      "w": w / width, "h": h / height})
+    return sorted(lines, key=lambda l: l["y"])
+
+
 def _ocr_image_tesseract(img, lang: str, min_confidence: int) -> str:
     """Screen artifacts -- dust on a texture, a UI border, a font's
     drop-shadow -- often get "recognized" as a stray character or short
@@ -323,38 +422,12 @@ def _ocr_image_windows(img, lang: str) -> str:
     return (result.get("text") or "").strip()
 
 
-# Many RPGs/visual novels show a speaking character's name in its own label
-# above a fully-quoted line of dialogue -- OCR flattens that into one line
-# where the name runs straight into the dialogue with nothing separating
-# them (e.g. "Augustin El Borne "And this must be your younger son..."").
-# split_speaker_name() recovers the boundary using the dialogue's own
-# opening quote mark as the split point, without needing to know anything
-# about font size or layout.
-_SPEAKER_NAME_MAX_LENGTH = 40
-_DIALOGUE_QUOTE_CHARS = "\"“"  # straight " and left curly double quote "
-
-
-def split_speaker_name(text: str):
-    """Returns (name, dialogue) if `text` looks like "<Name> "<Dialogue>"
-    with the name label run into the dialogue's opening quote, or
-    (None, text) if it doesn't -- e.g. the text already starts with a
-    quote (no name present), there's no quote anywhere (this game doesn't
-    wrap dialogue in quotes), or whatever comes before the quote reads like
-    ordinary sentence text rather than a name (too long, or not every word
-    Capitalized) -- so a narration line that merely *contains* a quote
-    doesn't get chopped in half."""
-    positions = [p for p in (text.find(ch) for ch in _DIALOGUE_QUOTE_CHARS) if p > 0]
-    if not positions:
-        return None, text
-    idx = min(positions)
-    candidate = text[:idx].strip()
-    dialogue = text[idx:].strip()
-    if not candidate or not dialogue or len(candidate) > _SPEAKER_NAME_MAX_LENGTH:
-        return None, text
-    words = [w for w in candidate.split() if any(c.isalpha() for c in w)]
-    if not words or not all(w[0].isupper() for w in words):
-        return None, text  # doesn't look Title Case -- probably not a name
-    return candidate, dialogue
+# split_speaker_name() now lives in game_profile.py, where it's registered as
+# the "quote" pattern style alongside the other speaker detectors -- it was
+# always one game's convention rather than a universal rule, and keeping it
+# next to its siblings is what stopped this file from growing a second and
+# third hardcoded convention beside it. Imported above so --speaker-name-mode
+# and everything else here keeps working exactly as before.
 
 
 def apply_speaker_name_mode(text: str, mode: str) -> str:
@@ -373,6 +446,26 @@ def apply_speaker_name_mode(text: str, mode: str) -> str:
     if mode == "announce":
         return f"{name}. {dialogue}"
     return text
+
+
+def apply_speaker_name_mode_for(name, dialogue, original, mode):
+    """Same three modes as apply_speaker_name_mode(), but for a name a
+    detector has ALREADY separated out. The margin and zone detectors find
+    the boundary from layout rather than punctuation, so there's nothing for
+    the quote heuristic to re-derive and calling it again would just fail to
+    split a line that's already split.
+
+    Worth knowing: once characters have their own voices, "skip" often reads
+    better than "announce" -- the voice change already tells you who's
+    talking, so repeating the name every line gets tiring. It's per-profile
+    precisely because that's a taste call."""
+    if not name:
+        return original
+    if mode == "skip":
+        return dialogue
+    if mode == "announce":
+        return f"{name}. {dialogue}"
+    return original
 
 
 # --------------------------------------------------------------------------
@@ -504,6 +597,20 @@ class Speaker:
                 "from https://github.com/espeak-ng/espeak-ng/releases   (Windows)",
             )
             self.rate = rate
+            # A bare variant ("+f3") is a suffix meant to ride on a base
+            # voice, not a voice in its own right -- espeak-ng rejects it
+            # outright ("Voice +f3 not found in available voices") if it
+            # ever arrives alone. say() below already forgives exactly this
+            # for a PER-CHARACTER variant, prepending "en" when there's no
+            # base to attach to (see the "+" branch there) -- the base voice
+            # itself deserves the same forgiveness rather than a runtime
+            # error, since it can arrive as a bare variant too: not through
+            # the GUI's own Voice dropdown (that only ever offers real base
+            # voices queried from espeak-ng itself), but via --voice on the
+            # command line or a hand-edited gui_settings.json, both of which
+            # bypass that dropdown entirely.
+            if voice and voice.startswith("+"):
+                voice = f"en{voice}"
             self.voice = voice
         elif engine == "piper":
             # Historically this shelled out to a "piper" binary (subprocess,
@@ -665,7 +772,22 @@ class Speaker:
             self.log(f"[speech] Couldn't build a custom Kokoro session ({e}) -- using kokoro-onnx's default threading.")
             return None
 
-    def say(self, text: str):
+    def say(self, text: str, voice=None, speaker_id=None, speed=None):
+        """`voice`/`speaker_id`/`speed` override this one utterance's
+        identity and pace -- how a cast member's per-model settings (see
+        game_profile.Cast.get_model()) are delivered. `voice` is whatever
+        the active engine expects as a COMPLETE, ready-to-use value -- a
+        Kokoro voice id, a full espeak-ng voice string INCLUDING its base
+        language ("en-us+m3", never a bare "+m3"), a SAPI5 voice name.
+        `speaker_id` is Piper-only: an integer index into a multi-speaker
+        model. `speed` means whatever that engine's own pacing knob means
+        (words/min for espeak-ng and SAPI5, a length_scale multiplier for
+        Piper, a speed multiplier for Kokoro). Any of these left as None
+        means "use whatever this Speaker was configured with", which is
+        what the narrator and any character nobody's assigned a voice to
+        under the model currently running get. Nothing in this class needs
+        to know where those per-model settings came from -- that's entirely
+        game_profile's and the Cast panel's business."""
         # OCR (grabbing a screenshot, running Tesseract) takes real time --
         # tens to hundreds of milliseconds, not nothing -- so the pause
         # hotkey can fire in the gap between the main loop deciding "this
@@ -685,17 +807,19 @@ class Speaker:
                 return
         self._stop_current()
         if self.engine == "espeak":
-            cmd = ["espeak-ng", "-s", str(self.rate)]
-            if self.voice:
-                cmd += ["-v", self.voice]
+            rate = int(speed) if speed is not None else self.rate
+            cmd = ["espeak-ng", "-s", str(rate)]
+            chosen = voice if voice else self.voice
+            if chosen:
+                cmd += ["-v", chosen]
             cmd.append(text)
             self._proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, **_POPEN_KWARGS)
         elif self.engine == "piper":
-            self._say_piper(text)
+            self._say_piper(text, speaker_id, speed)
         elif self.engine == "windows":
-            self._say_windows_sapi(text)
+            self._say_windows_sapi(text, voice, speed)
         else:
-            self._say_kokoro(text)
+            self._say_kokoro(text, voice, speed)
 
     def set_paused(self, paused: bool):
         """Called by the pause hotkey (see platform_adapter.HotkeyWatcher
@@ -710,16 +834,16 @@ class Speaker:
         if paused:
             self._stop_current()
 
-    def _say_piper(self, text: str):
+    def _say_piper(self, text: str, speaker_id=None, speed=None):
         # Runs in-process now (see the "piper" branch of __init__ for why),
         # same shape as Kokoro just below: synthesis is CPU-bound, so it
         # always happens in its own thread rather than blocking here and
         # stalling the OCR poll loop.
         with self._utterance_lock:
             my_id = self._utterance_id
-        threading.Thread(target=self._say_piper_worker, args=(text, my_id), daemon=True).start()
+        threading.Thread(target=self._say_piper_worker, args=(text, my_id, speaker_id, speed), daemon=True).start()
 
-    def _say_piper_worker(self, text: str, my_id: int):
+    def _say_piper_worker(self, text: str, my_id: int, speaker_id=None, speed=None):
         """voice.synthesize() yields one AudioChunk per sentence, played as
         each one is ready instead of waiting for the whole line -- same
         streaming-over-waiting reasoning as Kokoro's streaming worker below,
@@ -727,9 +851,14 @@ class Speaker:
         synchronous generator."""
         from piper import SynthesisConfig
 
+        # A Piper speaker is just a different integer index into the loaded
+        # multi-speaker model, so per-character casting costs nothing here --
+        # no second model to load, just a different argument on this call.
+        sid = self.piper_speaker if speaker_id is None else speaker_id
+        scale = self.piper_length_scale if speed is None else speed
         syn_config = SynthesisConfig(
-            speaker_id=self.piper_speaker,
-            length_scale=self.piper_length_scale,
+            speaker_id=sid,
+            length_scale=scale,
         )
         player = None
         try:
@@ -751,7 +880,7 @@ class Speaker:
             if player is not None:
                 player.close_stdin()
 
-    def _say_kokoro(self, text: str):
+    def _say_kokoro(self, text: str, voice=None, speed=None):
         # Kokoro's synthesis is a blocking, CPU-bound call, unlike
         # espeak-ng/Piper where we just hand text to an external process and
         # return immediately. Running it directly here would stall the OCR
@@ -768,10 +897,14 @@ class Speaker:
         with self._utterance_lock:
             my_id = self._utterance_id
 
+        # Kokoro voices are style vectors inside the one loaded model, so
+        # switching per character is just a different argument -- no reload,
+        # no extra memory.
         target = self._say_kokoro_streaming_worker if self._kokoro_streaming else self._say_kokoro_blocking_worker
-        threading.Thread(target=target, args=(text, my_id), daemon=True).start()
+        resolved_speed = speed if speed is not None else self.kokoro_speed
+        threading.Thread(target=target, args=(text, my_id, voice or self.kokoro_voice, resolved_speed), daemon=True).start()
 
-    def _say_kokoro_blocking_worker(self, text: str, my_id: int):
+    def _say_kokoro_blocking_worker(self, text: str, my_id: int, voice=None, speed=None):
         """Fallback for older kokoro-onnx installs without create_stream():
         synthesizes the whole line, then plays it all at once. Everything
         has to be ready before anything is audible, so a slow synthesis
@@ -780,7 +913,8 @@ class Speaker:
         import numpy as np
         try:
             samples, sample_rate = self._kokoro.create(
-                text, voice=self.kokoro_voice, speed=self.kokoro_speed, lang=self.kokoro_lang,
+                text, voice=voice or self.kokoro_voice,
+                speed=speed if speed is not None else self.kokoro_speed, lang=self.kokoro_lang,
             )
         except Exception as e:
             self.log(f"[speech] Kokoro synthesis failed: {e}")
@@ -803,7 +937,7 @@ class Speaker:
         player.write(pcm)
         player.close_stdin()
 
-    def _say_kokoro_streaming_worker(self, text: str, my_id: int):
+    def _say_kokoro_streaming_worker(self, text: str, my_id: int, voice=None, speed=None):
         """Uses kokoro-onnx's create_stream() to synthesize and play a line
         chunk-by-chunk (roughly sentence-by-sentence) instead of waiting for
         the whole thing. Playback of the first chunk starts as soon as it's
@@ -813,17 +947,18 @@ class Speaker:
         lever against "long pause when the CPU gets busy": before, the
         entire paragraph had to finish synthesizing before anything played."""
         try:
-            asyncio.run(self._stream_kokoro_chunks(text, my_id))
+            asyncio.run(self._stream_kokoro_chunks(text, my_id, voice, speed))
         except Exception as e:
             self.log(f"[speech] Kokoro streaming synthesis failed: {e}")
 
-    async def _stream_kokoro_chunks(self, text: str, my_id: int):
+    async def _stream_kokoro_chunks(self, text: str, my_id: int, voice=None, speed=None):
         import numpy as np
 
         player = None
         try:
             stream = self._kokoro.create_stream(
-                text, voice=self.kokoro_voice, speed=self.kokoro_speed, lang=self.kokoro_lang,
+                text, voice=voice or self.kokoro_voice,
+                speed=speed if speed is not None else self.kokoro_speed, lang=self.kokoro_lang,
             )
             async for samples, sample_rate in stream:
                 with self._utterance_lock:
@@ -842,7 +977,7 @@ class Speaker:
             if player is not None:
                 player.close_stdin()
 
-    def _say_windows_sapi(self, text: str):
+    def _say_windows_sapi(self, text: str, voice=None, speed=None):
         # pyttsx3's own .say()/.runAndWait() plays audio itself and only
         # supports being interrupted via a documented-but-flaky cross-thread
         # .stop() call. Rather than depend on that, this mirrors Kokoro's
@@ -853,9 +988,9 @@ class Speaker:
         # _stop_current() already knows how to terminate cleanly.
         with self._utterance_lock:
             my_id = self._utterance_id
-        threading.Thread(target=self._say_windows_sapi_worker, args=(text, my_id), daemon=True).start()
+        threading.Thread(target=self._say_windows_sapi_worker, args=(text, my_id, voice, speed), daemon=True).start()
 
-    def _say_windows_sapi_worker(self, text: str, my_id: int):
+    def _say_windows_sapi_worker(self, text: str, my_id: int, voice=None, speed=None):
         import tempfile
         import wave
 
@@ -863,8 +998,39 @@ class Speaker:
             wav_path = tmp.name
         try:
             with self._sapi_lock:
-                self._sapi_engine.save_to_file(text, wav_path)
-                self._sapi_engine.runAndWait()
+                # The voice AND rate changes are held inside this same lock:
+                # the SAPI5 engine is one shared object, so setting them and
+                # synthesizing have to be a single atomic step or another
+                # character's line could land between them and steal this
+                # one's voice or pace.
+                previous_voice = None
+                if voice:
+                    try:
+                        previous_voice = self._sapi_engine.getProperty("voice")
+                        self._sapi_engine.setProperty("voice", voice)
+                    except Exception:
+                        previous_voice = None
+                previous_rate = None
+                if speed is not None:
+                    try:
+                        previous_rate = self._sapi_engine.getProperty("rate")
+                        self._sapi_engine.setProperty("rate", speed)
+                    except Exception:
+                        previous_rate = None
+                try:
+                    self._sapi_engine.save_to_file(text, wav_path)
+                    self._sapi_engine.runAndWait()
+                finally:
+                    if previous_voice is not None:
+                        try:
+                            self._sapi_engine.setProperty("voice", previous_voice)
+                        except Exception:
+                            pass
+                    if previous_rate is not None:
+                        try:
+                            self._sapi_engine.setProperty("rate", previous_rate)
+                        except Exception:
+                            pass
 
             with self._utterance_lock:
                 if my_id != self._utterance_id:
@@ -988,16 +1154,24 @@ def _interruptible_sleep(seconds: float, stop_event) -> None:
         elapsed += chunk
 
 
-def run(args, stop_event=None, log=print, on_pause_change=None):
+def run(args, stop_event=None, log=print, on_pause_change=None,
+        profile=None, on_new_speaker=None, on_speaker_ready=None):
     """Runs the OCR -> speech loop until Ctrl+C (CLI) or stop_event is set
     (GUI, from a Stop button on another thread). `log` receives each status
     line — defaults to print for CLI use; the GUI passes a callback that
-    forwards into its log panel instead."""
+    forwards into its log panel instead.
+
+    `profile` is an optional game_profile.Profile supplying speaker detection
+    and the cast. Without one this loop behaves exactly as it always did, so
+    the CLI and any existing setup are unaffected. `on_new_speaker(entry,
+    line)` fires the first time a character speaks, which is what the GUI
+    hangs its "who is this?" prompt on; it must not block, since it runs on
+    this loop's thread."""
     apply_cpu_affinity(getattr(args, "cpu_affinity", "") or "", log=log)
 
     marker = None
     if args.ignore_popups:
-        marker = load_popup_marker()
+        marker = (profile.get("popup_marker") if profile is not None else None) or load_popup_marker()
         if marker is None:
             sys.exit("--ignore-popups needs a saved marker. Run with --select-popup-marker first.")
 
@@ -1015,7 +1189,10 @@ def run(args, stop_event=None, log=print, on_pause_change=None):
             "per-word confidence score, so --ocr-min-confidence has no effect."
         )
 
-    region = load_region()
+    # The profile owns the region when there is one -- that's what makes
+    # switching games a dropdown instead of re-dragging the box. region.json
+    # remains the fallback for the CLI and for anyone with no profile.
+    region = (profile.get("region") if profile is not None else None) or load_region()
     capturer = PLATFORM.make_capturer(region)
     speaker = None if args.quiet else Speaker(
         engine=args.engine, rate=args.rate, voice=args.voice, piper_model=args.piper_model,
@@ -1029,6 +1206,26 @@ def run(args, stop_event=None, log=print, on_pause_change=None):
         kokoro_cpu_threads=getattr(args, "kokoro_cpu_threads", None),
         log=log,
     )
+
+    # Identifies which model is actually running, for looking a character's
+    # per-model config up in the cast (see game_profile.model_key() and
+    # Cast.get_model()) -- fixed for the life of this run, since the engine
+    # and model don't change without restarting the reader.
+    model_key = game_profile.model_key(
+        args.engine,
+        piper_model=getattr(args, "piper_model", None),
+        kokoro_model=getattr(args, "kokoro_model", None),
+    )
+
+    if speaker is not None and on_speaker_ready:
+        # Hands the live Speaker to the GUI so its Cast panel can audition a
+        # voice on demand. Nothing in this loop depends on it, and building a
+        # second Speaker just to preview a voice would mean loading a whole
+        # second copy of the Kokoro/Piper model.
+        try:
+            on_speaker_ready(speaker)
+        except Exception:
+            pass
 
     log(f"Watching region {region} every {args.interval}s.")
     if marker:
@@ -1099,18 +1296,66 @@ def run(args, stop_event=None, log=print, on_pause_change=None):
                     _interruptible_sleep(args.interval, stop_event)
                     continue
 
-            img = capturer.grab()
-            img = preprocess_for_ocr(img)
-            text = ocr_image(img, lang=ocr_lang, min_confidence=getattr(args, "ocr_min_confidence", 40),
+            raw = capturer.grab()
+            img = preprocess_for_ocr(raw)
+            min_conf = getattr(args, "ocr_min_confidence", 40)
+            text = ocr_image(img, lang=ocr_lang, min_confidence=min_conf,
                               engine=ocr_engine, log=log)
-            text = apply_speaker_name_mode(text, getattr(args, "speaker_name_mode", "off"))
 
-            if text and similar(text, last_text) < args.similarity:
+            # Compare BEFORE the speaker name is stripped or announced, so the
+            # dedup check sees the same shape of string every poll. Deciding
+            # who's talking is comparatively expensive (it can involve a second
+            # OCR pass for the zone detector), and there's no reason to do it
+            # again for a line we already spoke.
+            changed = bool(text) and similar(text, last_text) < args.similarity
+
+            if changed:
+                spoken, who = text, None
+                cfg = None
+                if profile is not None:
+                    lines = ocr_lines(img, lang=ocr_lang, min_confidence=min_conf, engine=ocr_engine)
+
+                    def _crop(x0, y0, x1, y1, _src=raw):
+                        w, h = _src.size
+                        return _src.crop((int(w * x0), int(h * y0), int(w * x1), int(h * y1)))
+
+                    def _ocr(sub):
+                        return ocr_image(preprocess_for_ocr(sub), lang=ocr_lang,
+                                         min_confidence=min_conf, engine=ocr_engine, log=log)
+
+                    name, dialogue, _via = profile.detect(
+                        Observation(text, lines, crop=_crop, ocr=_ocr))
+                    entry, is_new = profile.cast.observe(name) if name else (profile.cast.narrator(), False)
+                    who = entry["name"] if entry else None
+                    cfg = profile.voice_for(entry, model_key) if entry else None
+                    spoken = apply_speaker_name_mode_for(
+                        name, dialogue, text, profile.get("speaker_name_mode", "announce"))
+                    if is_new and on_new_speaker:
+                        # Deliberately fired AFTER the voice is resolved and
+                        # just before speaking: a brand-new character says
+                        # their first line immediately -- in whatever the
+                        # engine's already configured with, since nothing's
+                        # assigned them a voice yet -- while the prompt waits
+                        # for an answer. Nothing here blocks on the user.
+                        try:
+                            on_new_speaker(entry, dialogue)
+                        except Exception as e:
+                            log(f"[cast] new-speaker callback failed: {e}")
+                else:
+                    spoken = apply_speaker_name_mode(text, getattr(args, "speaker_name_mode", "off"))
+
                 timestamp = time.strftime("%H:%M:%S")
-                log(f"[{timestamp}] {text}")
+                log(f"[{timestamp}] {('<' + who + '> ') if who else ''}{spoken}")
                 if speaker:
-                    speaker.say(text)
+                    cfg = cfg or {}
+                    speaker.say(spoken, voice=cfg.get("voice"),
+                                speaker_id=cfg.get("speaker"), speed=cfg.get("speed"))
                 last_text = text
+                if profile is not None:
+                    # Only ever writes when something actually changed -- a new
+                    # character confirmed, or a learned spelling. The poll
+                    # interval is the debounce.
+                    profile.save_if_dirty()
             elif not text:
                 # Box went empty (dialogue closed) — reset so the same
                 # line can be re-spoken if it reappears later.
