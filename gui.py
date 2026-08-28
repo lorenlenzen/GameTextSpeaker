@@ -25,7 +25,7 @@ from pathlib import Path
 
 try:
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox, scrolledtext
+    from tkinter import ttk, filedialog, scrolledtext
 except ImportError:
     sys.exit("Missing tkinter. Install it with:  sudo apt install python3-tk")
 
@@ -38,6 +38,76 @@ import game_profile as gp
 # real "en-us" -- can never silently get saved and break speech, so this
 # sentinel is how "no voice pinned" stays reachable through that dropdown.
 EMPTY_VOICE_LABEL = "(system default)"
+
+_DIALOG_ICONS = {"info": "ⓘ", "warning": "⚠", "error": "⛔"}
+
+
+def _show_dialog(parent, title: str, message: str, kind: str = "info"):
+    """Stand-in for tkinter.messagebox's showinfo/showerror/showwarning --
+    same one-button, modal, blocks-until-dismissed shape, but placed next
+    to wherever the mouse actually was when it popped up instead of
+    wherever Tk (or the window manager) feels like putting a bare
+    messagebox with no `parent=` -- which is what every call site in this
+    file used to be, since a plain tk_messageBox has no notion of "near
+    the button that opened it" at all. With several independent windows
+    open at once (main window, Cast, Transcript), centering on the wrong
+    one is exactly what read as "popping up in unexpected places."
+
+    `parent` only has to be some live widget in the window that triggered
+    this -- winfo_toplevel() finds the actual window from there, and
+    winfo_pointerx/y() finds the mouse regardless of which screen or
+    window it's over. transient() keeps this grouped with that window on
+    most window managers; "-topmost" is what actually guarantees it can't
+    end up buried behind it on the ones where transient() alone doesn't."""
+    toplevel = parent.winfo_toplevel()
+    win = tk.Toplevel(toplevel)
+    win.title(title)
+    win.resizable(False, False)
+    win.transient(toplevel)
+
+    body = ttk.Frame(win, padding=16)
+    body.pack(fill="both", expand=True)
+    row = ttk.Frame(body)
+    row.pack(fill="both", expand=True)
+    ttk.Label(row, text=_DIALOG_ICONS.get(kind, "ⓘ"), font=("TkDefaultFont", 16)).pack(
+        side="left", padx=(0, 12), anchor="n")
+    ttk.Label(row, text=message, justify="left", wraplength=360).pack(side="left", fill="both", expand=True)
+
+    btn_row = ttk.Frame(body)
+    btn_row.pack(fill="x", pady=(14, 0))
+    ok = ttk.Button(btn_row, text="OK", width=8, command=win.destroy)
+    ok.pack(side="right")
+    win.bind("<Return>", lambda _e: win.destroy())
+    win.bind("<Escape>", lambda _e: win.destroy())
+    win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+    # Sized to its own content first (update_idletasks forces the geometry
+    # manager to run without waiting for the event loop), then placed near
+    # the pointer and clamped so a click near a screen edge can't push it
+    # partly off-screen.
+    win.update_idletasks()
+    w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    x = min(max(toplevel.winfo_pointerx() + 12, 0), max(sw - w, 0))
+    y = min(max(toplevel.winfo_pointery() + 12, 0), max(sh - h, 0))
+    win.geometry(f"{w}x{h}+{x}+{y}")
+
+    win.attributes("-topmost", True)
+    win.grab_set()
+    ok.focus_set()
+    win.wait_window()
+
+
+def show_info(parent, title: str, message: str):
+    _show_dialog(parent, title, message, kind="info")
+
+
+def show_warning(parent, title: str, message: str):
+    _show_dialog(parent, title, message, kind="warning")
+
+
+def show_error(parent, title: str, message: str):
+    _show_dialog(parent, title, message, kind="error")
 
 
 def _basename_or_placeholder(path_str: str) -> str:
@@ -263,6 +333,16 @@ ENGINE_INSTALL_HINT = {
     "windows": "pip install pyttsx3  (wraps the OS's own built-in SAPI5 voices -- no extra download needed)",
 }
 
+# Shown in the Speech engine ⓘ info button (see App._engine_info_text()) --
+# the radios themselves show just the short name now (ENGINE_LABELS), same
+# horizontal layout as the Cast window's own engine picker.
+ENGINE_DESCRIPTIONS = {
+    "windows": "Built-in, zero setup.",
+    "espeak": "Robotic, needs espeak-ng installed separately.",
+    "piper": "Natural, needs a model.",
+    "kokoro": "Most natural, bigger download.",
+}
+
 OCR_ENGINE_AVAILABILITY = {
     "tesseract": _binary_available("tesseract"),
     "windows": sys.platform == "win32" and _package_available("winocr"),
@@ -276,6 +356,12 @@ OCR_ENGINE_LABELS = {
 OCR_ENGINE_INSTALL_HINT = {
     "tesseract": "install the tesseract-ocr binary separately (any OS) -- see README",
     "windows": "pip install winocr  (may also need an OCR language pack added via Windows Settings -- see README)",
+}
+
+# Shown in the OCR engine ⓘ info button (see App._ocr_engine_info_text()).
+OCR_ENGINE_DESCRIPTIONS = {
+    "windows": "Built-in, zero setup.",
+    "tesseract": "Needs the tesseract-ocr binary installed separately.",
 }
 
 SETTINGS_PATH = Path(__file__).with_name("gui_settings.json")
@@ -375,6 +461,26 @@ class CastWindow:
         ttk.Label(header, textvariable=self.title_var, font=("TkDefaultFont", 10, "bold")).pack(side="left")
         ttk.Button(header, text="Refresh", command=self.refresh).pack(side="right")
 
+        # Defaults ON: this window's main reason to exist mid-playthrough is
+        # assigning a voice to a character who just showed up, and a game
+        # running borderless/windowed fullscreen (the mode this app's OCR
+        # capture actually needs -- see README) will otherwise cover this
+        # window right back up the moment you click into the game again.
+        # "-topmost" keeps it visible above the game without needing a full
+        # alt-tab each time; it has no effect over a TRUE exclusive-fullscreen
+        # game, since nothing but that game is allowed to render at all then.
+        #
+        # Saved per-profile (see _on_keep_on_top_changed()/refresh() below),
+        # since one game might run exclusive-fullscreen (nothing to cover)
+        # while another runs borderless windowed right under this window --
+        # not something everyone wants the same answer to every time. Stays
+        # enabled and usable with no profile loaded too, though there's
+        # nowhere to save the choice until one is.
+        self.on_top_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(header, text="Keep on top", variable=self.on_top_var,
+                         command=self._on_keep_on_top_changed).pack(side="right", padx=(0, 10))
+        self._apply_on_top()
+
         # Which engine's cast/config this window is showing -- independent of
         # whichever one Speech has selected to actually run, so you can set
         # up (or just double check) any engine's characters ahead of time.
@@ -399,6 +505,25 @@ class CastWindow:
         self.model_area = ttk.Frame(self.win, padding=(10, 0, 10, 0))
         self.model_area.pack(fill="x")
 
+        # Also per-profile -- see game_profile.Cast.observe()'s `freeze`
+        # parameter. Set from refresh() (below), not here: there's no
+        # profile yet at __init__ time, and setting a BooleanVar doesn't
+        # fire its own command, so that's a safe place to sync it without
+        # triggering a spurious save.
+        freeze_row = ttk.Frame(self.win, padding=(10, 0, 10, 4))
+        freeze_row.pack(fill="x")
+        self.freeze_var = tk.BooleanVar(value=False)
+        self.freeze_check = ttk.Checkbutton(
+            freeze_row, text="Freeze adding new cast members",
+            variable=self.freeze_var, command=self._on_freeze_changed)
+        self.freeze_check.pack(side="left")
+        self.app._add_info_button(
+            freeze_row,
+            "When checked, a name nobody's met yet is never added to the cast -- that line just "
+            "falls back to the default voice, the same as a line with no detected speaker at all. "
+            "Characters already in the cast are unaffected; this only stops new arrivals.",
+            title="Freeze adding new cast members", side="left")
+
         self.hint_var = tk.StringVar(value="")
         ttk.Label(
             self.win, padding=(10, 0, 10, 6), justify="left", wraplength=520,
@@ -422,6 +547,20 @@ class CastWindow:
         scroll.pack(side="right", fill="y")
 
         self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _apply_on_top(self):
+        try:
+            self.win.attributes("-topmost", bool(self.on_top_var.get()))
+        except tk.TclError:
+            pass  # window already gone -- nothing to do
+
+    def _on_keep_on_top_changed(self):
+        self._apply_on_top()
+        profile = self.app.profile
+        if profile is None:
+            return
+        profile.set("keep_on_top", bool(self.on_top_var.get()))
+        profile.save_if_dirty()
 
     def alive(self) -> bool:
         try:
@@ -482,6 +621,13 @@ class CastWindow:
         self.app._save_settings()
         self.refresh()
 
+    def _on_freeze_changed(self):
+        profile = self.app.profile
+        if profile is None:
+            return
+        profile.set("freeze_cast", bool(self.freeze_var.get()))
+        profile.save_if_dirty()
+
     def refresh(self, highlight=None):
         if not self.alive():
             return
@@ -491,9 +637,14 @@ class CastWindow:
         self._rows = []
         if profile is None:
             ttk.Label(self.body, text="No profile loaded.").pack(anchor="w")
+            self.freeze_check.config(state="disabled")
             return
 
         self.title_var.set(profile.name)
+        self.freeze_check.config(state="normal")
+        self.freeze_var.set(bool(profile.get("freeze_cast", False)))
+        self.on_top_var.set(bool(profile.get("keep_on_top", True)))
+        self._apply_on_top()
 
         engine = self.engine_var.get()
         self._rebuild_model_area(engine)
@@ -616,7 +767,7 @@ class CastWindow:
                     try:
                         fields["speaker"] = int(raw)
                     except ValueError:
-                        messagebox.showerror("Invalid speaker", f'"{raw}" isn\'t a whole number.')
+                        show_error(self.win, "Invalid speaker", f'"{raw}" isn\'t a whole number.')
                         reverted = field_text(current, "speaker")
                         pv.set(reverted if reverted or primary_state == "normal" else EMPTY_VOICE_LABEL)
                         return
@@ -630,7 +781,7 @@ class CastWindow:
                 try:
                     fields["speed"] = float(raw_speed)
                 except ValueError:
-                    messagebox.showerror("Invalid speed", f'"{raw_speed}" isn\'t a number.')
+                    show_error(self.win, "Invalid speed", f'"{raw_speed}" isn\'t a number.')
                     sv.set(field_text(current, "speed"))
                     return
 
@@ -642,38 +793,139 @@ class CastWindow:
         speed_entry.bind("<FocusOut>", commit)
         speed_entry.bind("<Return>", commit)
 
-        ttk.Button(row, text="Test", width=5,
+        ttk.Button(row, text="🔊", width=3,
                    command=lambda e=entry: self.app._speak_sample(e, key)).pack(side="left")
 
         # The Narrator is a reserved slot -- Cast.__init__ recreates it the
         # moment it's gone -- so removing it would only reappear, with
         # nothing assigned again. Simplest to just not offer it here.
         if entry["name"] != gp.NARRATOR:
-            ttk.Button(row, text="Remove", width=7,
+            ttk.Button(row, text="🗑", width=3,
                        command=lambda e=entry: self._remove(e)).pack(side="left")
 
         self._rows.append((entry, primary_var, speed_var))
 
     def _remove(self, entry):
-        """Delete a cast member the detectors got wrong -- a page number, a
+        """Delete a cast member detection got wrong -- a page number, a
         chapter heading, a mid-sentence OCR fragment that got confirmed
-        before it could be filtered out. Confirms first: this can't be
-        undone from here, and the name disappearing from the *next* line it
-        actually speaks (if it's real) is the only way back."""
+        before it could be filtered out. No confirmation prompt: this can't
+        be undone from here, but it isn't destructive in any lasting way
+        either -- if this was a real character, they're simply re-added, as
+        a new unconfirmed entry, the next time they speak."""
         profile = self.app.profile
         if profile is None:
             return
-        label = entry["name"]
-        if not messagebox.askyesno(
-            "Remove character",
-            f'Remove "{label}" from the cast?\n\n'
-            "If this was a real character, they'll be re-added -- as a new, "
-            "unconfirmed entry -- the next time they speak.",
-        ):
-            return
-        if profile.cast.remove(label):
+        if profile.cast.remove(entry["name"]):
             profile.save_if_dirty()
             self.refresh()
+
+
+class TranscriptWindow:
+    """A second, deliberately plain window that shows nothing but the
+    detected/spoken dialogue -- no timestamps, no "[speech] loading model"
+    or "[cast] new speaker" chatter. It exists for people who already run
+    their own TTS or screen reader and just want this app's OCR+detection
+    output as clean text to point that tool at, instead of picking through
+    the operational Log for the lines that matter (see
+    game_text_speaker.run()'s on_transcript hook, which is what feeds this
+    instead of the main log once this window -- or any -- has ever been
+    opened this session).
+
+    Same "Keep on top" idea as CastWindow, for the same reason: this is
+    meant to sit visible over a borderless/windowed game, not get buried
+    the moment you click back into it.
+
+    "Stream to clipboard" is the other half of the accessibility story: a
+    plain Tk Text widget doesn't participate in the OS accessibility tree
+    (Tk has no real UI Automation/AT-SPI support), so a generic screen
+    reader can't actually see this window's content change on its own --
+    it would have to be manually re-read after every line. Plenty of
+    lightweight external TTS/screen-reading tools work off the clipboard
+    instead of the accessibility tree, though, so this checkbox copies
+    each new line there the moment it's spoken. Off by default, since it
+    takes over the system clipboard while it's running -- turning it on
+    means anything you manually copy elsewhere gets overwritten by the
+    next line."""
+
+    def __init__(self, app):
+        self.app = app
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Transcript")
+        self.win.geometry("520x420")
+        self.win.minsize(320, 200)
+
+        header = ttk.Frame(self.win, padding=(10, 8, 10, 4))
+        header.pack(fill="x")
+        ttk.Label(header, text="Transcript", font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        ttk.Button(header, text="Clear", command=self._clear).pack(side="right")
+        self.on_top_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(header, text="Keep on top", variable=self.on_top_var,
+                         command=self._apply_on_top).pack(side="right", padx=(0, 10))
+        self.clipboard_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(header, text="Stream to clipboard", variable=self.clipboard_var).pack(
+            side="right", padx=(0, 10))
+        self._apply_on_top()
+
+        ttk.Label(
+            self.win, padding=(10, 0, 10, 4), justify="left", wraplength=460,
+            text="Plain spoken-line output -- nothing else lands here. Point your own "
+                 "screen reader or TTS tool at this window if you'd rather it read the "
+                 "lines than this app's own speech engine (turn on Quiet in Speech to "
+                 "stop this app from also speaking them itself). If your tool reads the "
+                 "clipboard instead of a window, turn on \"Stream to clipboard\" -- each "
+                 "new line replaces whatever's on it, since the clipboard only ever holds "
+                 "one thing at a time.",
+        ).pack(fill="x")
+
+        text_frame = ttk.Frame(self.win, padding=(10, 0, 10, 10))
+        text_frame.pack(fill="both", expand=True)
+        self.text = scrolledtext.ScrolledText(text_frame, state="disabled", wrap="word")
+        self.text.pack(fill="both", expand=True)
+
+        # Backfill whatever was already spoken before this window existed,
+        # so opening it mid-playthrough doesn't start on a blank page.
+        for who, spoken in self.app._transcript_lines:
+            self._append(who, spoken)
+
+    def _apply_on_top(self):
+        try:
+            self.win.attributes("-topmost", bool(self.on_top_var.get()))
+        except tk.TclError:
+            pass  # window already gone -- nothing to do
+
+    def alive(self) -> bool:
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _clear(self):
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.config(state="disabled")
+
+    def append(self, who, spoken):
+        """Called on the Tk main thread only (see App._drain_log_queue), for
+        a line arriving live while this window is open -- as opposed to
+        _append(), also used to backfill history on open (see __init__),
+        which deliberately does NOT touch the clipboard: replaying old
+        lines onto it the instant the window opens would just stomp
+        whatever the user had copied, for lines nobody's currently reading."""
+        self._append(who, spoken)
+        if self.clipboard_var.get():
+            line = f"{who}: {spoken}" if who else spoken
+            try:
+                self.win.clipboard_clear()
+                self.win.clipboard_append(line)
+            except tk.TclError:
+                pass  # clipboard briefly unavailable/owned elsewhere -- just skip this line
+
+    def _append(self, who, spoken):
+        line = f"{who}: {spoken}" if who else spoken
+        self.text.config(state="normal")
+        self.text.insert("end", line + "\n")
+        self.text.see("end")
+        self.text.config(state="disabled")
 
 
 class App:
@@ -695,13 +947,16 @@ class App:
 
         self.profile = None
         self.cast_window = None
+        self.transcript_window = None
         self._live_speaker = None   # set while running, for the reader's own speech
         self._preview_speakers = {}  # _preview_key(engine) -> Speaker, for Cast's Test button (see _speak_sample)
         self._preview_loading = set()  # _preview_key(engine) values currently being built, to dedupe clicks
+        self._transcript_lines = []  # (who, spoken) history, so opening the Transcript window late still shows it
 
         self._build_ui()
         self._load_active_profile()
         self._refresh_region_status()
+        self._refresh_name_region_status()
         self._refresh_popup_status()
         self.root.after(100, self._drain_log_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -777,7 +1032,7 @@ class App:
         section's top-right)."""
         padx = (4, 0) if side == "left" else (0, 4)
         ttk.Button(parent, text="ⓘ", width=2,
-                   command=lambda: messagebox.showinfo(title, text)).pack(side=side, padx=padx)
+                   command=lambda: show_info(parent, title, text)).pack(side=side, padx=padx)
 
     def _build_ui(self):
         pad = {"padx": 6, "pady": 4}
@@ -808,17 +1063,46 @@ class App:
             "different engine entirely.",
             title="Game profiles", side="right")
         ttk.Button(game_row, text="Cast…", command=self._open_cast_window).pack(side="right", padx=(0, 4))
+        ttk.Button(game_row, text="Transcript…", command=self._open_transcript_window).pack(side="right", padx=(0, 4))
         ttk.Button(game_row, text="New…", command=self._on_new_profile).pack(side="right", padx=(0, 4))
 
         region_frame = ttk.LabelFrame(self.root, text="1. Dialogue region")
         region_frame.pack(fill="x", **pad)
-        self.region_status_label = ttk.Label(region_frame, text="")
+
+        # Own row, deliberately -- packing these three straight into
+        # region_frame (as this used to, back when it was the only row)
+        # would let the two side="right" buttons each claim a FULL-HEIGHT
+        # column on the right of the whole LabelFrame, not just this row,
+        # squeezing every row added below (Name region) into whatever
+        # narrow sliver was left between them and the label. Confining
+        # left/right packing to its own row is what keeps each row
+        # independent and full-width.
+        region_row = ttk.Frame(region_frame)
+        region_row.pack(fill="x")
+        self.region_status_label = ttk.Label(region_row, text="")
         self.region_status_label.pack(side="left", padx=6, pady=6)
-        btn = ttk.Button(region_frame, text="From Screenshot…", command=self._on_select_region_from_image)
+        btn = ttk.Button(region_row, text="From Screenshot…", command=self._on_select_region_from_image)
         btn.pack(side="right", padx=6, pady=6)
         self._action_buttons.append(btn)
-        btn = ttk.Button(region_frame, text="Select Region…", command=self._on_select_region)
+        btn = ttk.Button(region_row, text="Select Region…", command=self._on_select_region)
         btn.pack(side="right", padx=6, pady=6)
+        self._action_buttons.append(btn)
+
+        # Name region: a SECOND, independently-watched box for whoever's
+        # speaking -- see game_profile.py's detect_speaker(). Optional and
+        # per-profile; leaving it unset means every line reads as the
+        # Narrator, same as before this existed.
+        ttk.Separator(region_frame, orient="horizontal").pack(fill="x", padx=6, pady=(0, 4))
+
+        name_region_row = ttk.Frame(region_frame)
+        name_region_row.pack(fill="x", padx=6, pady=(0, 4))
+        self.name_region_status_label = ttk.Label(name_region_row, text="")
+        self.name_region_status_label.pack(side="left")
+        btn = ttk.Button(name_region_row, text="From Screenshot…", command=self._on_select_name_region_from_image)
+        btn.pack(side="right")
+        self._action_buttons.append(btn)
+        btn = ttk.Button(name_region_row, text="Select Name Region…", command=self._on_select_name_region)
+        btn.pack(side="right", padx=(0, 4))
         self._action_buttons.append(btn)
 
         popup_frame = ttk.LabelFrame(self.root, text="2. Ignore popups/overlays (optional)")
@@ -854,17 +1138,17 @@ class App:
         # listed first since picking it is the one choice that overrides
         # everything below it.
         self.engine_var = tk.StringVar(value="quiet" if self.settings["quiet"] else self.settings["engine"])
-        engine_choices = [("quiet", "Quiet — log recognized text, don't speak it")]
+        engine_choices = [("quiet", "Quiet")]
         if sys.platform == "win32":
             # Listed first among the real engines on Windows: it's the
             # zero-setup option there (no separate install, unlike
             # espeak-ng/Piper/Kokoro) and the default engine on this
             # platform -- see DEFAULT_SETTINGS.
-            engine_choices.append(("windows", "Windows Native — built-in, zero setup"))
+            engine_choices.append(("windows", ENGINE_LABELS["windows"]))
         engine_choices += [
-            ("espeak", "espeak-ng — robotic, needs espeak-ng installed separately"),
-            ("piper", "Piper — natural, needs a model"),
-            ("kokoro", "Kokoro — most natural, bigger download"),
+            ("espeak", ENGINE_LABELS["espeak"]),
+            ("piper", ENGINE_LABELS["piper"]),
+            ("kokoro", ENGINE_LABELS["kokoro"]),
         ]
         # Disabling every unavailable engine is only useful when at least
         # one real engine remains selectable -- if something about this
@@ -872,32 +1156,24 @@ class App:
         # disabling all of them would leave the selector with only "Quiet"
         # reachable and no way to actually hear anything. In that unlikely
         # case, every option is left enabled and _on_start()'s own checks
-        # are what surface the real problem once the user hits Start.
+        # are what surface the real problem once the user hits Start. What
+        # each one actually is/needs lives in the ⓘ info button now, not a
+        # label here -- see _engine_info_text().
         any_available = any(ENGINE_AVAILABILITY.get(name) for name, _ in engine_choices if name != "quiet")
         self.engine_radios = {}
-        engine_list_col = ttk.Frame(engine_col)
-        engine_list_col.pack(fill="x")
-        for i, (name, label) in enumerate(engine_choices):
+        engine_row = ttk.Frame(engine_col)
+        engine_row.pack(fill="x")
+        ttk.Label(engine_row, text="Engine:").pack(side="left")
+        for name, label in engine_choices:
             if name == "quiet":
                 state = "normal"
             else:
                 state = "normal" if (not any_available or ENGINE_AVAILABILITY.get(name)) else "disabled"
-            if i == 0:
-                # The info button lines up with this first radio's row
-                # (rather than sitting in its own row above, or centered
-                # against the full stacked height of every radio below) --
-                # pinned to the right edge of that one row.
-                first_engine_row = ttk.Frame(engine_list_col)
-                first_engine_row.pack(fill="x")
-                rb = ttk.Radiobutton(first_engine_row, text=label, variable=self.engine_var,
-                                      value=name, command=self._on_engine_selected, state=state)
-                rb.pack(side="left", anchor="w")
-                self._add_info_button(first_engine_row, self._engine_info_text(), title="Speech engine", side="right")
-            else:
-                rb = ttk.Radiobutton(engine_list_col, text=label, variable=self.engine_var,
-                                      value=name, command=self._on_engine_selected, state=state)
-                rb.pack(anchor="w")
+            rb = ttk.Radiobutton(engine_row, text=label, variable=self.engine_var,
+                                  value=name, command=self._on_engine_selected, state=state)
+            rb.pack(side="left", padx=(6, 0))
             self.engine_radios[name] = rb
+        self._add_info_button(engine_row, self._engine_info_text(), title="Speech engine", side="right")
 
         # espeak-ng and Windows Native have no engine-wide Rate/Voice fields
         # here anymore, and Piper/Kokoro have no Model fields here either --
@@ -949,33 +1225,24 @@ class App:
         ocr_engine_row.pack(fill="x", padx=6, pady=(6, 0))
         self.ocr_engine_var = tk.StringVar(value=self.settings["ocr_engine"])
         ocr_engine_choices = (
-            [("windows", "Windows Native — built-in, zero setup")] if sys.platform == "win32" else []
-        ) + [("tesseract", "Tesseract — needs the tesseract-ocr binary installed separately")]
+            [("windows", OCR_ENGINE_LABELS["windows"])] if sys.platform == "win32" else []
+        ) + [("tesseract", OCR_ENGINE_LABELS["tesseract"])]
         # Same reasoning as the speech engine radios above: disabling every
         # unavailable OCR engine is only useful when at least one remains
         # selectable -- if neither is available, every option is left
-        # enabled instead and _on_start() surfaces the real problem.
+        # enabled instead and _on_start() surfaces the real problem. What
+        # each one actually needs lives in the ⓘ info button now, not a
+        # label here -- see _ocr_engine_info_text().
         any_ocr_available = any(OCR_ENGINE_AVAILABILITY.get(name) for name, _ in ocr_engine_choices)
         self.ocr_engine_radios = {}
-        ocr_engine_list_col = ttk.Frame(ocr_engine_row)
-        ocr_engine_list_col.pack(fill="x")
-        for i, (name, label) in enumerate(ocr_engine_choices):
+        ttk.Label(ocr_engine_row, text="Engine:").pack(side="left")
+        for name, label in ocr_engine_choices:
             state = "normal" if (not any_ocr_available or OCR_ENGINE_AVAILABILITY.get(name)) else "disabled"
-            if i == 0:
-                # Same reasoning as the speech engine radios above: lines up
-                # with this first radio's own row, pinned to the right edge,
-                # rather than centered against the full stacked height.
-                first_ocr_row = ttk.Frame(ocr_engine_list_col)
-                first_ocr_row.pack(fill="x")
-                rb = ttk.Radiobutton(first_ocr_row, text=label, variable=self.ocr_engine_var,
-                                      value=name, command=self._update_ocr_engine_widgets, state=state)
-                rb.pack(side="left", anchor="w")
-                self._add_info_button(first_ocr_row, self._ocr_engine_info_text(), title="OCR engine", side="right")
-            else:
-                rb = ttk.Radiobutton(ocr_engine_list_col, text=label, variable=self.ocr_engine_var,
-                                      value=name, command=self._update_ocr_engine_widgets, state=state)
-                rb.pack(anchor="w")
+            rb = ttk.Radiobutton(ocr_engine_row, text=label, variable=self.ocr_engine_var,
+                                  value=name, command=self._update_ocr_engine_widgets, state=state)
+            rb.pack(side="left", padx=(6, 0))
             self.ocr_engine_radios[name] = rb
+        self._add_info_button(ocr_engine_row, self._ocr_engine_info_text(), title="OCR engine", side="right")
 
         self.lang_row = ttk.Frame(ocr_frame)
         self.lang_row.pack(fill="x", padx=6, pady=(4, 0))
@@ -1110,28 +1377,26 @@ class App:
 
     def _engine_info_text(self) -> str:
         shown = (["windows"] if sys.platform == "win32" else []) + ["espeak", "piper", "kokoro"]
-        lines = ["Speech engine status on this system:", ""]
+        lines = ["Quiet — log recognized text, don't speak it."]
         for name in shown:
             ok = ENGINE_AVAILABILITY.get(name)
-            line = f"{ENGINE_LABELS[name]}: {'installed' if ok else 'NOT installed'}"
+            line = f"{ENGINE_LABELS[name]} — {ENGINE_DESCRIPTIONS[name]} {'Installed.' if ok else 'NOT installed.'}"
             if not ok:
                 line += f"\n    -> {ENGINE_INSTALL_HINT[name]}"
             lines.append(line)
-        lines.append("")
-        lines.append("A greyed-out option means it isn't installed yet -- install it per the note above, "
-                      "then restart this app to pick it up.")
-        return "\n".join(lines)
+        return "\n\n".join(lines)
 
     def _ocr_engine_info_text(self) -> str:
         shown = (["windows"] if sys.platform == "win32" else []) + ["tesseract"]
-        lines = ["OCR engine status on this system:", ""]
+        lines = []
         for name in shown:
             ok = OCR_ENGINE_AVAILABILITY.get(name)
-            line = f"{OCR_ENGINE_LABELS[name]}: {'installed' if ok else 'NOT installed'}"
+            line = (f"{OCR_ENGINE_LABELS[name]} — {OCR_ENGINE_DESCRIPTIONS[name]} "
+                    f"{'Installed.' if ok else 'NOT installed.'}")
             if not ok:
                 line += f"\n    -> {OCR_ENGINE_INSTALL_HINT[name]}"
             lines.append(line)
-        return "\n".join(lines)
+        return "\n\n".join(lines)
 
     # ---------------- status labels ----------------
 
@@ -1170,6 +1435,40 @@ class App:
                 self.log(f"[profile] Couldn't save the region to this profile: {e}")
         self._refresh_region_status()
 
+    def _refresh_name_region_status(self):
+        """Purely display -- same idea as _refresh_region_status(), but for
+        the profile's name_region (see game_profile.py's detect_speaker()).
+        There's no global fallback file for this one the way region.json
+        covers the profile-less CLI case: without a profile there is no
+        name region, full stop, since character detection is a profile
+        concept end to end."""
+        if self.profile is None:
+            self.name_region_status_label.config(text="Name region: (create or choose a game profile first)")
+            return
+        region = self.profile.get("name_region")
+        if region:
+            self.name_region_status_label.config(
+                text=f"Name region set: {region['x']},{region['y']}  {region['w']}x{region['h']}")
+        else:
+            self.name_region_status_label.config(
+                text="Name region: not set (every line reads as Narrator)")
+
+    def _adopt_selected_name_region(self):
+        """Called after the user picks a name region -- mirrors
+        _adopt_selected_region(), reading back NAME_REGION_CONFIG_PATH
+        instead of CONFIG_PATH so the two picks never clobber each other,
+        even when done back to back."""
+        if self.profile is not None:
+            try:
+                if core.NAME_REGION_CONFIG_PATH.exists():
+                    picked = json.loads(core.NAME_REGION_CONFIG_PATH.read_text())
+                    if picked:
+                        self.profile.set("name_region", picked)
+                        self.profile.save_if_dirty()
+            except Exception as e:
+                self.log(f"[profile] Couldn't save the name region to this profile: {e}")
+        self._refresh_name_region_status()
+
     def _refresh_popup_status(self):
         self.popup_status_label.config(text=_popup_status_text())
 
@@ -1196,6 +1495,22 @@ class App:
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
+    # Capped so a very long playthrough can't grow this without bound just
+    # to backfill a Transcript window that might never get opened this run.
+    TRANSCRIPT_MAX_LINES = 500
+
+    def _on_transcript(self, who, spoken):
+        """Called from the reader's own thread (see the on_transcript= wiring
+        in _on_start's worker()) -- only ever hands work to the Tk thread
+        through the queue, same as on_new_speaker/on_pause_change above."""
+        self.log_queue.put(("transcript", (who, spoken)))
+
+    def _append_transcript(self, who, spoken):
+        self._transcript_lines.append((who, spoken))
+        del self._transcript_lines[:-self.TRANSCRIPT_MAX_LINES]
+        if self.transcript_window is not None and self.transcript_window.alive():
+            self.transcript_window.append(who, spoken)
+
     def _drain_log_queue(self):
         try:
             while True:
@@ -1215,6 +1530,8 @@ class App:
                     self.status_label.config(text="Paused" if payload else "Running…")
                 elif kind == "new_speaker":
                     self._on_new_speaker_ui(payload)
+                elif kind == "transcript":
+                    self._append_transcript(*payload)
         except queue.Empty:
             pass
         self.root.after(100, self._drain_log_queue)
@@ -1292,12 +1609,13 @@ class App:
         try:
             self.profile = gp.load_profile(path)
         except Exception as e:
-            messagebox.showerror("Couldn't open profile", str(e))
+            show_error(self.root, "Couldn't open profile", str(e))
             return
         self.settings["profile"] = self.profile.path.name
         self._save_settings()
         self.log(f"[profile] Switched to '{self.profile.name}'.")
         self._refresh_region_status()
+        self._refresh_name_region_status()
         if self.cast_window is not None and self.cast_window.alive():
             self.cast_window.refresh()
 
@@ -1307,36 +1625,27 @@ class App:
         name = simpledialog.askstring("New game profile", "Name this game:", parent=self.root)
         if not name or not name.strip():
             return
-        # The one real decision at creation time: should the reader try to
-        # tell characters apart at all? "Yes" turns on the pattern/margin
-        # detectors (the normal case -- new characters show up in Cast as
-        # they speak, ready for their own voice). "No" leaves the profile
-        # with no detectors, so every line is credited to the Narrator --
-        # no per-character voices, no cast list to curate, just one voice
-        # throughout. Nothing else about a fresh profile needs deciding: an
-        # unassigned character (or the Narrator, until you set one) just
-        # sounds like whatever the current engine's Speech settings say.
-        auto_detect = messagebox.askyesno(
-            "Auto-detect characters?",
-            "Should new characters be detected automatically as they speak, "
-            "so each one can get their own voice in Cast?\n\n"
-            "Choose No for a game where everything should just be read in "
-            "the Narrator's voice.",
-            parent=self.root,
-        )
+        # Nothing else about a fresh profile needs deciding up front. It
+        # starts with no Name region set, which means every line is
+        # credited to the Narrator -- no per-character voices, no cast list
+        # to curate, just one voice throughout, exactly like before. Drawing
+        # a Name region (see the Dialogue region section) is what turns
+        # per-character detection on, whenever you're ready for it -- an
+        # unassigned character (or the Narrator) just sounds like whatever
+        # the current engine's Speech settings say in the meantime.
         try:
-            overrides = {} if auto_detect else {"detectors": []}
-            self.profile = gp.create_profile(name.strip(), **overrides)
+            self.profile = gp.create_profile(name.strip())
         except OSError as e:
-            messagebox.showerror("Couldn't create profile", str(e))
+            show_error(self.root, "Couldn't create profile", str(e))
             return
         self.settings["profile"] = self.profile.path.name
         self._save_settings()
         self._refresh_profile_list()
-        detect_note = "" if auto_detect else " (no character auto-detection -- everything reads as Narrator)"
-        self.log(f"[profile] Created '{self.profile.name}' (profiles/{self.profile.path.name}){detect_note}. "
-                 f"Pick a region for it next.")
+        self.log(f"[profile] Created '{self.profile.name}' (profiles/{self.profile.path.name}). "
+                 f"Pick a region for it next -- and a Name region too, if you want characters "
+                 f"detected and given their own voices.")
         self._refresh_region_status()
+        self._refresh_name_region_status()
 
     def _on_new_speaker_ui(self, name):
         """A character has just spoken for the first time. Deliberately
@@ -1348,11 +1657,18 @@ class App:
 
     def _open_cast_window(self, highlight=None):
         if self.profile is None:
-            messagebox.showinfo("No profile", "Create or choose a game profile first.")
+            show_info(self.root, "No profile", "Create or choose a game profile first.")
             return
         if self.cast_window is None or not self.cast_window.alive():
             self.cast_window = CastWindow(self)
         self.cast_window.refresh(highlight=highlight)
+
+    def _open_transcript_window(self):
+        # No profile required -- even profile-less runs still detect and
+        # speak lines (see game_text_speaker.run()), so there's still
+        # something useful to show here.
+        if self.transcript_window is None or not self.transcript_window.alive():
+            self.transcript_window = TranscriptWindow(self)
 
     def _preview_key(self, engine):
         """Identifies a specific, loadable speech configuration for
@@ -1460,8 +1776,45 @@ class App:
             core.select_region_from_image(path, master=self.root, log=self.log)
         except Exception as e:
             self.log(f"Error: {e}")
-            messagebox.showerror("Selection failed", str(e))
+            show_error(self.root, "Selection failed", str(e))
         self._adopt_selected_region()
+
+    def _on_select_name_region(self):
+        if self.profile is None:
+            show_info(self.root, "No profile", "Create or choose a game profile first.")
+            return
+        self._set_actions_enabled(False)
+        self.log("Select Name Region: click the button, then Alt+Tab back to the game — "
+                  "drag a box around wherever the speaker's name shows (its own nameplate, "
+                  "or the dialogue box itself if the name runs into the text there).")
+
+        def worker():
+            try:
+                core.select_region(log=self.log, target_path=core.NAME_REGION_CONFIG_PATH)
+            except (SystemExit, Exception) as e:
+                self.log(f"Error: {e}")
+            finally:
+                self.log_queue.put(("action_done", self._adopt_selected_name_region))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_select_name_region_from_image(self):
+        if self.profile is None:
+            show_info(self.root, "No profile", "Create or choose a game profile first.")
+            return
+        path = filedialog.askopenfilename(
+            title="Select a screenshot with the character's name visible",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            core.select_region_from_image(path, master=self.root, log=self.log,
+                                           target_path=core.NAME_REGION_CONFIG_PATH)
+        except Exception as e:
+            self.log(f"Error: {e}")
+            show_error(self.root, "Selection failed", str(e))
+        self._adopt_selected_name_region()
 
     def _on_select_popup_marker(self):
         self._set_actions_enabled(False)
@@ -1512,15 +1865,15 @@ class App:
 
     def _on_start(self):
         if not core.CONFIG_PATH.exists():
-            messagebox.showwarning("No region set", "Select a dialogue region first (step 1).")
+            show_warning(self.root, "No region set", "Select a dialogue region first (step 1).")
             return
 
         settings = self._collect_settings()
         self._save_settings()
 
         if settings["ignore_popups"] and not core.POPUP_MARKER_PATH.exists():
-            messagebox.showwarning(
-                "No popup marker",
+            show_warning(
+                self.root, "No popup marker",
                 "'Ignore popups' is checked but no popup marker is saved yet. "
                 "Select one first (step 2), or uncheck it.",
             )
@@ -1534,15 +1887,15 @@ class App:
         # while Quiet is selected rather than blocking Start over a model
         # file quiet mode will never touch.
         if not settings["quiet"] and settings["engine"] == "piper" and not settings["piper_model"]:
-            messagebox.showwarning(
-                "Piper model required",
+            show_warning(
+                self.root, "Piper model required",
                 "Select a Piper .onnx model file first, or switch to espeak-ng.",
             )
             return
 
         if not settings["quiet"] and settings["engine"] == "kokoro" and not (settings["kokoro_model"] and settings["kokoro_voices"]):
-            messagebox.showwarning(
-                "Kokoro model required",
+            show_warning(
+                self.root, "Kokoro model required",
                 "Select both Kokoro's model (.onnx) and voices (.bin) files first, or switch engines.",
             )
             return
@@ -1553,8 +1906,8 @@ class App:
             # gui_settings.json from before it was uninstalled -- or before
             # this was even Windows -- can still leave engine_var pointing
             # at "windows" underneath a disabled, still-"selected" radio.
-            messagebox.showwarning(
-                "Windows Native not available",
+            show_warning(
+                self.root, "Windows Native not available",
                 "This engine needs Windows plus 'pip install pyttsx3' (dependency checks run once when "
                 "this app starts, so if you just installed pyttsx3, restart it first). Switch to a "
                 "different engine, or install pyttsx3 and restart.",
@@ -1574,8 +1927,8 @@ class App:
             try:
                 kokoro_cpu_threads = int(settings["kokoro_cpu_threads"])
             except ValueError:
-                messagebox.showwarning(
-                    "Invalid CPU threads",
+                show_warning(
+                    self.root, "Invalid CPU threads",
                     f"CPU threads {settings['kokoro_cpu_threads']!r} isn't a whole number. "
                     "Leave it blank to let onnxruntime pick its own default, or enter a whole number (e.g. 6).",
                 )
@@ -1641,7 +1994,8 @@ class App:
                 core.run(args, stop_event=stop_event, log=self.log,
                          on_pause_change=on_pause_change, profile=profile,
                          on_new_speaker=on_new_speaker,
-                         on_speaker_ready=on_speaker_ready)
+                         on_speaker_ready=on_speaker_ready,
+                         on_transcript=self._on_transcript)
             except (SystemExit, Exception) as e:
                 self.log(f"Error: {e}")
             finally:

@@ -36,10 +36,16 @@ from platform_adapter import (
     get_platform_adapter, check_dependency, pick_region_from_image, subprocess_no_window_kwargs,
 )
 import game_profile
-from game_profile import Observation, split_speaker_name
+from game_profile import Observation, ink_density
 
 CONFIG_PATH = Path(__file__).with_name("region.json")
+NAME_REGION_CONFIG_PATH = Path(__file__).with_name("name_region.json")
 POPUP_MARKER_PATH = Path(__file__).with_name("popup_marker.json")
+
+# Below this, a name-region crop is treated as blank (nobody's nameplate is
+# showing -- the narrator is talking) and skipped without spending an OCR
+# call on it. See run()'s per-poll name-region capture.
+NAME_REGION_MIN_INK = 0.01
 
 # The one place this process asks "which OS am I on" -- everywhere else in
 # this file just calls PLATFORM's methods. See platform_adapter.py.
@@ -58,11 +64,16 @@ def apply_cpu_affinity(affinity: str, log=print) -> None:
 # Region selection — run once, saves {x, y, w, h} to region.json
 # --------------------------------------------------------------------------
 
-def select_region(log=print) -> dict:
+def select_region(log=print, target_path=None) -> dict:
+    """`target_path` lets the same picker double as the name-region picker
+    (see NAME_REGION_CONFIG_PATH) -- it's the identical "drag a box" flow
+    either way, just saved somewhere else so the two selections never
+    clobber each other."""
+    target_path = target_path or CONFIG_PATH
     log("Drag a box around the text area you want watched (e.g. the dialogue box)...")
     region = PLATFORM.select_region(log=log)
-    CONFIG_PATH.write_text(json.dumps(region, indent=2))
-    log(f"Saved region {region} to {CONFIG_PATH}")
+    target_path.write_text(json.dumps(region, indent=2))
+    log(f"Saved region {region} to {target_path}")
     return region
 
 
@@ -124,7 +135,7 @@ def load_popup_marker():
     return json.loads(POPUP_MARKER_PATH.read_text())
 
 
-def select_region_from_image(image_path: str, master=None, log=print) -> dict:
+def select_region_from_image(image_path: str, master=None, log=print, target_path=None) -> dict:
     """Fallback region picker for when the game can't be alt-tabbed away
     from (e.g. exclusive fullscreen blocks slop/slurp's overlay on Linux).
     You take a full-screen screenshot *of your desktop* while the text is
@@ -154,6 +165,8 @@ def select_region_from_image(image_path: str, master=None, log=print) -> dict:
             raise RuntimeError(msg)
         sys.exit(msg)
 
+    target_path = target_path or CONFIG_PATH
+
     from PIL import Image
 
     path = Path(image_path)
@@ -178,8 +191,8 @@ def select_region_from_image(image_path: str, master=None, log=print) -> dict:
     except Exception:
         pass  # best-effort check only; not fatal if mss/monitor info isn't available
 
-    CONFIG_PATH.write_text(json.dumps(result, indent=2))
-    log(f"Saved region {result} to {CONFIG_PATH}")
+    target_path.write_text(json.dumps(result, indent=2))
+    log(f"Saved region {result} to {target_path}")
     return result
 
 
@@ -200,6 +213,29 @@ def preprocess_for_ocr(img):
 
 
 _PURE_PUNCT_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+
+# Quote marks, straight and curly, single and double. A token made purely of
+# one or two of these is NOT noise -- see _is_noise_token() -- even though
+# it's technically all-punctuation like the genuine noise this filter exists
+# to catch.
+_QUOTE_CHARS = set("\"'“”‘’")
+
+
+def _is_noise_token(tok: str) -> bool:
+    """True for a token that's pure OCR/screen-artifact noise -- a lone
+    ".", "|", "_", or similar -- that clean_ocr_text() should drop outright.
+
+    Deliberately NOT true for a token made up ENTIRELY of quote marks, even
+    though those are technically all-punctuation too: Tesseract's own
+    word-segmentation quite often splits a quote mark off from the word
+    it's touching into its own separate token -- an extra sliver of a gap
+    before the opening `"Now`, say. Dropping it here deleted it silently:
+    the resulting text looked completely normal (one clean space where the
+    quote used to be), so there was no visible sign a quote mark had just
+    been erased out from under the dialogue text."""
+    if not _PURE_PUNCT_RE.match(tok):
+        return False
+    return not (tok and all(c in _QUOTE_CHARS for c in tok))
 
 # A handful of abbreviations that are legitimately followed by a lowercase
 # word (unlike a real sentence-ending period) -- kept out of
@@ -235,16 +271,20 @@ def clean_ocr_text(text: str) -> str:
     """Drop OCR/screen-artifact noise that made it past the confidence
     filter in _ocr_image_tesseract() (Tesseract only -- see ocr_image()):
     tokens with no letters or digits at all (a lone
-    ".", "|", "_", "''", or the stray glyph a game's "continue" arrow often
-    gets misread as), plus a period stray-inserted mid-sentence (see
+    ".", "|", "_", or the stray glyph a game's "continue" arrow often gets
+    misread as -- see _is_noise_token(), which carves out an exception for
+    a lone quote mark), plus a period stray-inserted mid-sentence (see
     _fix_stray_periods()). Deliberately conservative about whole-token
     removal -- it only drops a token when EVERY character in it is
     punctuation/symbols, so real words keep their attached punctuation
     ("don't", "well-known", "Hello!") and short real words ("a", "I") are
-    untouched."""
+    untouched. Splitting on whitespace and rejoining with single spaces
+    also folds away anything OCR reports as an odd-looking gap -- a
+    non-breaking space, a doubled space -- since Python treats all of
+    those as whitespace here regardless of which exact character it was."""
     if not text:
         return text
-    text = " ".join(tok for tok in text.split() if not _PURE_PUNCT_RE.match(tok))
+    text = " ".join(tok for tok in text.split() if not _is_noise_token(tok))
     return _fix_stray_periods(text)
 
 
@@ -266,103 +306,6 @@ def ocr_image(img, lang: str, min_confidence: int = 40, engine: str = "tesseract
     if engine == "windows":
         return clean_ocr_text(_ocr_image_windows(img, lang))
     return clean_ocr_text(_ocr_image_tesseract(img, lang, min_confidence))
-
-
-def ocr_lines(img, lang: str, min_confidence: int = 40, engine: str = "tesseract") -> list:
-    """Where each recognized line of text SITS, not just what it says.
-
-    Returns [{"text", "x", "y", "w", "h"}, ...] with the geometry as
-    FRACTIONS of the image rather than pixels, so a profile written at one
-    resolution still describes the same layout at another.
-
-    This costs nothing extra: Tesseract's image_to_data() -- already what
-    _ocr_image_tesseract() calls, for the per-word confidence scores -- has
-    been returning per-word bounding boxes all along, and we were throwing
-    them away. That geometry is what lets the "margin" detector notice a
-    speaker name set apart from the body text without being told where to
-    look, which in turn is what makes speaker detection work in games whose
-    dialogue isn't quoted.
-
-    Returns [] rather than raising if the engine can't supply positions --
-    the detectors that need geometry simply don't fire, and the ones that
-    work on flat text carry on."""
-    try:
-        if engine == "windows":
-            return _ocr_lines_windows(img, lang)
-        return _ocr_lines_tesseract(img, lang, min_confidence)
-    except Exception:
-        return []
-
-
-def _ocr_lines_tesseract(img, lang: str, min_confidence: int) -> list:
-    import pytesseract
-    from pytesseract import Output
-
-    data = pytesseract.image_to_data(img, lang=lang, output_type=Output.DICT)
-    width, height = img.size
-    if not width or not height:
-        return []
-
-    grouped = {}
-    for i, word in enumerate(data.get("text", [])):
-        word = word.strip()
-        if not word:
-            continue
-        try:
-            if int(data["conf"][i]) < min_confidence:
-                continue
-        except (ValueError, TypeError, KeyError):
-            continue
-        # block/paragraph/line together are Tesseract's own idea of "same
-        # line", which is more reliable than clustering by y ourselves.
-        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        left, top = data["left"][i], data["top"][i]
-        right, bottom = left + data["width"][i], top + data["height"][i]
-        entry = grouped.get(key)
-        if entry is None:
-            grouped[key] = {"words": [word], "l": left, "t": top, "r": right, "b": bottom}
-        else:
-            entry["words"].append(word)
-            entry["l"] = min(entry["l"], left)
-            entry["t"] = min(entry["t"], top)
-            entry["r"] = max(entry["r"], right)
-            entry["b"] = max(entry["b"], bottom)
-
-    lines = []
-    for entry in grouped.values():
-        lines.append({
-            "text": clean_ocr_text(" ".join(entry["words"])),
-            "x": entry["l"] / width, "y": entry["t"] / height,
-            "w": (entry["r"] - entry["l"]) / width,
-            "h": (entry["b"] - entry["t"]) / height,
-        })
-    return sorted(lines, key=lambda l: l["y"])
-
-
-def _ocr_lines_windows(img, lang: str) -> list:
-    """Windows' OCR API reports a bounding rect per line too. Read
-    defensively -- winocr's dict shape has moved around between versions,
-    and losing geometry should degrade the detectors, not break OCR."""
-    import winocr
-
-    result = winocr.recognize_pil_sync(img, lang)
-    width, height = img.size
-    if not width or not height:
-        return []
-    lines = []
-    for line in (result.get("lines") or []):
-        text = (line.get("text") or "").strip()
-        if not text:
-            continue
-        rect = line.get("bounding_rect") or line.get("boundingRect") or {}
-        try:
-            x, y = float(rect["x"]), float(rect["y"])
-            w, h = float(rect["width"]), float(rect["height"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        lines.append({"text": clean_ocr_text(text), "x": x / width, "y": y / height,
-                      "w": w / width, "h": h / height})
-    return sorted(lines, key=lambda l: l["y"])
 
 
 def _ocr_image_tesseract(img, lang: str, min_confidence: int) -> str:
@@ -422,23 +365,39 @@ def _ocr_image_windows(img, lang: str) -> str:
     return (result.get("text") or "").strip()
 
 
-# split_speaker_name() now lives in game_profile.py, where it's registered as
-# the "quote" pattern style alongside the other speaker detectors -- it was
-# always one game's convention rather than a universal rule, and keeping it
-# next to its siblings is what stopped this file from growing a second and
-# third hardcoded convention beside it. Imported above so --speaker-name-mode
-# and everything else here keeps working exactly as before.
-
-
 def apply_speaker_name_mode(text: str, mode: str) -> str:
     """mode "off" (default): leave text exactly as OCR'd. "skip": drop a
     detected speaker-name label, speaking only the dialogue. "announce":
     speak the name first with a pause (a period) before the dialogue,
-    instead of it running straight into the first word. See
-    split_speaker_name() for how the name is detected."""
+    instead of it running straight into the first word.
+
+    Only reachable with NO profile loaded at all -- with one, speaker
+    detection goes through Profile.detect() and its own configured name
+    region instead (see run()). Without a profile there's no separate name
+    region to point at, so this looks for the one inline convention common
+    enough to be worth a built-in fallback even with nothing configured: a
+    name running straight into an opening quote, e.g. `Tommas "Hello
+    there."`. Whatever comes before the FIRST quote mark of any style
+    (straight or curly -- OCR renders either depending on the game's font)
+    is taken as the candidate name and validated the same way a name
+    region's crop would be (see game_profile._looks_like_name())."""
     if mode == "off" or not text:
         return text
-    name, dialogue = split_speaker_name(text)
+    name, dialogue = None, text
+    positions = [text.find(q) for q in _QUOTE_CHARS]
+    positions = [p for p in positions if p >= 0]
+    if positions:
+        idx = min(positions)
+        candidate = text[:idx].strip()
+        if game_profile._looks_like_name(candidate):
+            # Resume from the quote mark itself and skip forward over any
+            # further non-alnum characters (the quote, extra spaces) so the
+            # dialogue doesn't come back with a stray leading quote mark.
+            cut = idx
+            while cut < len(text) and not text[cut].isalnum():
+                cut += 1
+            stripped = text[cut:].strip()
+            name, dialogue = candidate, (stripped or text[idx:].strip())
     if name is None:
         return text
     if mode == "skip":
@@ -449,11 +408,9 @@ def apply_speaker_name_mode(text: str, mode: str) -> str:
 
 
 def apply_speaker_name_mode_for(name, dialogue, original, mode):
-    """Same three modes as apply_speaker_name_mode(), but for a name a
-    detector has ALREADY separated out. The margin and zone detectors find
-    the boundary from layout rather than punctuation, so there's nothing for
-    the quote heuristic to re-derive and calling it again would just fail to
-    split a line that's already split.
+    """Same three modes as apply_speaker_name_mode(), but for a name
+    Profile.detect() has ALREADY separated out via its own name region, so
+    there's nothing left to re-derive from the text itself.
 
     Worth knowing: once characters have their own voices, "skip" often reads
     better than "announce" -- the voice change already tells you who's
@@ -1154,8 +1111,51 @@ def _interruptible_sleep(seconds: float, stop_event) -> None:
         elapsed += chunk
 
 
+def _grab_dialogue_and_name(capturer, region, name_region):
+    """Captures the dialogue box AND the name region from ONE single
+    screenshot, whatever their actual geometry -- the exact same box, one
+    nested inside the other, overlapping, a few pixels off from each other
+    (two separately hand-dragged boxes are never going to line up to the
+    pixel), or two totally unrelated spots on screen. Both regions are
+    absolute {x, y, w, h} screen pixels (see Profile's
+    "region"/"name_region").
+
+    This replaces an earlier version of this idea that tried to detect
+    whether the name region sat exactly inside the dialogue region and
+    only shared a frame in that one case -- falling back to a SEPARATE,
+    separately-timed grab() otherwise (including whenever the two boxes
+    were close but not pixel-identical, which is the normal case for two
+    hand-drawn boxes). Two grabs taken moments apart can each land on a
+    different instant if the game's text is still animating in, or has
+    already advanced by the time the second one fires -- which read as
+    "no name found" even though the dialogue text plainly had one. Always
+    grabbing the smallest rectangle that CONTAINS both regions, once, and
+    cropping both out of that single frame removes the race entirely
+    instead of trying to dodge it case by case.
+
+    Returns (dialogue_img, name_img), both cropped from that one grab."""
+    rx0, ry0 = float(region["x"]), float(region["y"])
+    rw, rh = float(region["w"]), float(region["h"])
+    nx0, ny0 = float(name_region["x"]), float(name_region["y"])
+    nw, nh = float(name_region["w"]), float(name_region["h"])
+
+    ux0 = min(rx0, nx0)
+    uy0 = min(ry0, ny0)
+    ux1 = max(rx0 + rw, nx0 + nw)
+    uy1 = max(ry0 + rh, ny0 + nh)
+    union_box = {"x": int(ux0), "y": int(uy0), "w": int(round(ux1 - ux0)), "h": int(round(uy1 - uy0))}
+
+    raw = capturer.grab(union_box)
+    dialogue_img = raw.crop((int(round(rx0 - ux0)), int(round(ry0 - uy0)),
+                              int(round(rx0 - ux0 + rw)), int(round(ry0 - uy0 + rh))))
+    name_img = raw.crop((int(round(nx0 - ux0)), int(round(ny0 - uy0)),
+                          int(round(nx0 - ux0 + nw)), int(round(ny0 - uy0 + nh))))
+    return dialogue_img, name_img
+
+
 def run(args, stop_event=None, log=print, on_pause_change=None,
-        profile=None, on_new_speaker=None, on_speaker_ready=None):
+        profile=None, on_new_speaker=None, on_speaker_ready=None,
+        on_transcript=None):
     """Runs the OCR -> speech loop until Ctrl+C (CLI) or stop_event is set
     (GUI, from a Stop button on another thread). `log` receives each status
     line — defaults to print for CLI use; the GUI passes a callback that
@@ -1166,7 +1166,16 @@ def run(args, stop_event=None, log=print, on_pause_change=None,
     the CLI and any existing setup are unaffected. `on_new_speaker(entry,
     line)` fires the first time a character speaks, which is what the GUI
     hangs its "who is this?" prompt on; it must not block, since it runs on
-    this loop's thread."""
+    this loop's thread.
+
+    `on_transcript(who, spoken)` fires once per detected/spoken line, with
+    the clean text and nothing else -- no timestamp, no "[speech]"/"[cast]"
+    noise. It exists for people who already have their own TTS or screen
+    reader and just want this app's output as plain text (see the GUI's
+    Transcript window). When it's given, that line is handed to it INSTEAD
+    of going through `log`, so the operational log doesn't end up with two
+    copies of the same dialogue. Leaving it None (the CLI's default) keeps
+    the line in `log`, exactly as before -- nothing changes for the CLI."""
     apply_cpu_affinity(getattr(args, "cpu_affinity", "") or "", log=log)
 
     marker = None
@@ -1296,7 +1305,26 @@ def run(args, stop_event=None, log=print, on_pause_change=None,
                     _interruptible_sleep(args.interval, stop_event)
                     continue
 
-            raw = capturer.grab()
+            # Dialogue box and name region (if one's configured) are grabbed
+            # from a single screenshot -- see _grab_dialogue_and_name() for
+            # why: two SEPARATE grabs, even taken back to back, can each
+            # land on a different instant if the game's text is still
+            # animating in or has already advanced by the time the second
+            # one fires, which reads as "no name found" even though the
+            # dialogue text plainly has one. One grab removes that race
+            # instead of dodging it.
+            name_raw = None
+            name_region = profile.get("name_region") if profile is not None else None
+            if name_region:
+                try:
+                    raw, name_raw = _grab_dialogue_and_name(capturer, region, name_region)
+                except Exception as e:
+                    log(f"[cast] Couldn't read the dialogue+name regions together: {e}")
+                    raw = capturer.grab()
+                    name_raw = None
+            else:
+                raw = capturer.grab()
+
             img = preprocess_for_ocr(raw)
             min_conf = getattr(args, "ocr_min_confidence", 40)
             text = ocr_image(img, lang=ocr_lang, min_confidence=min_conf,
@@ -1304,39 +1332,34 @@ def run(args, stop_event=None, log=print, on_pause_change=None,
 
             # Compare BEFORE the speaker name is stripped or announced, so the
             # dedup check sees the same shape of string every poll. Deciding
-            # who's talking is comparatively expensive (it can involve a second
-            # OCR pass for the zone detector), and there's no reason to do it
-            # again for a line we already spoke.
+            # who's talking is comparatively expensive (it can involve a
+            # second OCR pass, for the name region), and there's no reason to
+            # do it again for a line we already spoke.
             changed = bool(text) and similar(text, last_text) < args.similarity
 
             if changed:
                 spoken, who = text, None
                 cfg = None
+                is_new = False
                 if profile is not None:
-                    lines = ocr_lines(img, lang=ocr_lang, min_confidence=min_conf, engine=ocr_engine)
+                    # A blank crop (nobody's nameplate showing, or a narration
+                    # line in a game where the name shares the dialogue box)
+                    # skips OCR entirely: it's the narrator, not a misread.
+                    name_text = ""
+                    if name_raw is not None and ink_density(name_raw) >= NAME_REGION_MIN_INK:
+                        name_text = ocr_image(preprocess_for_ocr(name_raw), lang=ocr_lang,
+                                               min_confidence=min_conf, engine=ocr_engine, log=log)
 
-                    def _crop(x0, y0, x1, y1, _src=raw):
-                        w, h = _src.size
-                        return _src.crop((int(w * x0), int(h * y0), int(w * x1), int(h * y1)))
-
-                    def _ocr(sub):
-                        return ocr_image(preprocess_for_ocr(sub), lang=ocr_lang,
-                                         min_confidence=min_conf, engine=ocr_engine, log=log)
-
-                    name, dialogue, _via = profile.detect(
-                        Observation(text, lines, crop=_crop, ocr=_ocr))
-                    entry, is_new = profile.cast.observe(name) if name else (profile.cast.narrator(), False)
+                    name, dialogue = profile.detect(Observation(text, name_text))
+                    freeze = bool(profile.get("freeze_cast", False))
+                    entry, is_new = profile.cast.observe(name, freeze=freeze) if name else (profile.cast.narrator(), False)
                     who = entry["name"] if entry else None
                     cfg = profile.voice_for(entry, model_key) if entry else None
                     spoken = apply_speaker_name_mode_for(
                         name, dialogue, text, profile.get("speaker_name_mode", "announce"))
                     if is_new and on_new_speaker:
-                        # Deliberately fired AFTER the voice is resolved and
-                        # just before speaking: a brand-new character says
-                        # their first line immediately -- in whatever the
-                        # engine's already configured with, since nothing's
-                        # assigned them a voice yet -- while the prompt waits
-                        # for an answer. Nothing here blocks on the user.
+                        # Fired before the pause below takes effect, so a GUI
+                        # can log/react before speech actually stops.
                         try:
                             on_new_speaker(entry, dialogue)
                         except Exception as e:
@@ -1344,13 +1367,40 @@ def run(args, stop_event=None, log=print, on_pause_change=None,
                 else:
                     spoken = apply_speaker_name_mode(text, getattr(args, "speaker_name_mode", "off"))
 
-                timestamp = time.strftime("%H:%M:%S")
-                log(f"[{timestamp}] {('<' + who + '> ') if who else ''}{spoken}")
+                if on_transcript:
+                    on_transcript(who, spoken)
+                else:
+                    timestamp = time.strftime("%H:%M:%S")
+                    log(f"[{timestamp}] {('<' + who + '> ') if who else ''}{spoken}")
+
+                paused_for_new_speaker = False
+                if is_new and not pause_event.is_set():
+                    # A brand-new cast member's first line would otherwise
+                    # play immediately in whatever the engine already
+                    # happens to be configured with, since nothing's
+                    # assigned them a voice yet. Pausing here -- the same
+                    # mechanism as the manual pause hotkey, just triggered
+                    # automatically instead of by a keypress; see
+                    # on_pause_toggle above -- gives a beat to open the Cast
+                    # panel and set one up before it's spoken. Speaker.say()
+                    # below refuses to start anything while paused, and
+                    # clearing last_text means this exact line gets spoken
+                    # in full, correctly voiced, the moment the user resumes
+                    # -- instead of just being lost.
+                    pause_event.set()
+                    if speaker:
+                        speaker.set_paused(True)
+                    log(f"[cast] Paused -- \"{who}\" just joined the cast. Give them a voice in "
+                        f"the Cast panel, then press the pause key to resume.")
+                    if on_pause_change:
+                        on_pause_change(True)
+                    paused_for_new_speaker = True
+
                 if speaker:
                     cfg = cfg or {}
                     speaker.say(spoken, voice=cfg.get("voice"),
                                 speaker_id=cfg.get("speaker"), speed=cfg.get("speed"))
-                last_text = text
+                last_text = "" if paused_for_new_speaker else text
                 if profile is not None:
                     # Only ever writes when something actually changed -- a new
                     # character confirmed, or a learned spelling. The poll
