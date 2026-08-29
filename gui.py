@@ -17,6 +17,7 @@ import argparse
 import importlib.util
 import json
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -39,10 +40,40 @@ import game_profile as gp
 # sentinel is how "no voice pinned" stays reachable through that dropdown.
 EMPTY_VOICE_LABEL = "(system default)"
 
-_DIALOG_ICONS = {"info": "ⓘ", "warning": "⚠", "error": "⛔"}
+# Small black circle-i icon for _add_info_button(), embedded as base64 PNG
+# rather than drawn from a Unicode glyph (both the earlier "u2139" and the
+# "u24d8" it replaced rendered inconsistently -- thin, tiny, or a fallback
+# box -- depending on what the running system's default font happened to
+# ship for that codepoint). Tk has no real SVG support even in 8.6, so this
+# is the practical equivalent: a tiny raster, built once with Pillow (a
+# 16x16 circle+"i" drawn at 16x scale and downsampled with a BOX/area-
+# average filter -- not LANCZOS, which rings/overshoots at a hard edge and
+# was showing up as a faint halo outside the circle) and embedded here so
+# there's no extra asset file to ship or go missing -- it looks identical
+# on every platform this app runs on, unlike a font glyph.
+_INFO_ICON_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAA30lEQVR4nK2TTaqDMBSFvz6ciBCc"
+    "S8alZC/lIZ25yeIanHRm4U7cQncQKLmdaIkSpX8HMkhyzpfc/MCX2iXGMuAfOAL7cWwAWuAM3LeA"
+    "B6AHFFDnnDrndOqPc4et8G0yW2vVe6/ee7XWxpBbCpLFKwNqjFERURFRY0wMmHaSxYDTwvBKOwH8"
+    "jYBjqqY8zymKYq3kWeaSWqXrOhWRtR1cptpXVVUVZVluWZ4lDJuutIYY0H4AaGPAGbguHSEEQgip"
+    "8HXMzDR7SIDWda1N0ywPL/mQYkjP+t33y/DPP9PbegBlpnLplRx2xQAAAABJRU5ErkJggg=="
+)
+
+_info_icon_photo = None
 
 
-def _show_dialog(parent, title: str, message: str, kind: str = "info"):
+def _info_icon() -> "tk.PhotoImage":
+    """Lazily creates and caches the info-icon PhotoImage. Cached at module
+    level (not per-call) because Tk garbage-collects a PhotoImage the
+    instant nothing references it, which would otherwise blank a button's
+    icon out from under it the next time Tk redraws."""
+    global _info_icon_photo
+    if _info_icon_photo is None:
+        _info_icon_photo = tk.PhotoImage(data=_INFO_ICON_PNG_B64, format="png")
+    return _info_icon_photo
+
+
+def _show_dialog(parent, title: str, message: str, kind: str = "info", extra=None):
     """Stand-in for tkinter.messagebox's showinfo/showerror/showwarning --
     same one-button, modal, blocks-until-dismissed shape, but placed next
     to wherever the mouse actually was when it popped up instead of
@@ -52,6 +83,19 @@ def _show_dialog(parent, title: str, message: str, kind: str = "info"):
     the button that opened it" at all. With several independent windows
     open at once (main window, Cast, Transcript), centering on the wrong
     one is exactly what read as "popping up in unexpected places."
+
+    No icon is drawn here -- there used to be one (a Unicode glyph picked
+    by `kind`), but that carries the same font-rendering-quality risk that
+    turned out badly for the small info-button icon (see _info_icon()):
+    plain text, no image asset, so it's at the mercy of whatever glyph
+    coverage happens to be installed. `kind` is kept as a parameter anyway
+    since show_info/show_warning/show_error already pass it, and it's a
+    reasonable hook if this ever wants a real per-kind icon (an embedded
+    PNG, the same way _info_icon() works) instead of none at all.
+
+    `extra`, if given, is an (label, command) pair for one additional
+    button shown to the left of OK, invoked, then this dialog closes. Not
+    currently used by any call site, but kept as a general capability.
 
     `parent` only has to be some live widget in the window that triggered
     this -- winfo_toplevel() finds the actual window from there, and
@@ -67,16 +111,20 @@ def _show_dialog(parent, title: str, message: str, kind: str = "info"):
 
     body = ttk.Frame(win, padding=16)
     body.pack(fill="both", expand=True)
-    row = ttk.Frame(body)
-    row.pack(fill="both", expand=True)
-    ttk.Label(row, text=_DIALOG_ICONS.get(kind, "ⓘ"), font=("TkDefaultFont", 16)).pack(
-        side="left", padx=(0, 12), anchor="n")
-    ttk.Label(row, text=message, justify="left", wraplength=360).pack(side="left", fill="both", expand=True)
+    ttk.Label(body, text=message, justify="left", wraplength=360).pack(fill="both", expand=True)
 
     btn_row = ttk.Frame(body)
     btn_row.pack(fill="x", pady=(14, 0))
     ok = ttk.Button(btn_row, text="OK", width=8, command=win.destroy)
     ok.pack(side="right")
+    if extra is not None:
+        extra_label, extra_command = extra
+
+        def _run_extra(cmd=extra_command):
+            win.destroy()
+            cmd()
+
+        ttk.Button(btn_row, text=extra_label, command=_run_extra).pack(side="right", padx=(0, 6))
     win.bind("<Return>", lambda _e: win.destroy())
     win.bind("<Escape>", lambda _e: win.destroy())
     win.protocol("WM_DELETE_WINDOW", win.destroy)
@@ -98,8 +146,8 @@ def _show_dialog(parent, title: str, message: str, kind: str = "info"):
     win.wait_window()
 
 
-def show_info(parent, title: str, message: str):
-    _show_dialog(parent, title, message, kind="info")
+def show_info(parent, title: str, message: str, extra=None):
+    _show_dialog(parent, title, message, kind="info", extra=extra)
 
 
 def show_warning(parent, title: str, message: str):
@@ -397,26 +445,6 @@ DEFAULT_SETTINGS = {
 }
 
 
-def _region_status_text() -> str:
-    if core.CONFIG_PATH.exists():
-        try:
-            r = json.loads(core.CONFIG_PATH.read_text())
-            return f"Region set: {r['x']},{r['y']}  {r['w']}x{r['h']}"
-        except Exception:
-            return "Region: (couldn't read region.json)"
-    return "Region: not set yet"
-
-
-def _popup_status_text() -> str:
-    if core.POPUP_MARKER_PATH.exists():
-        try:
-            m = json.loads(core.POPUP_MARKER_PATH.read_text())
-            return f"Marker set: {m['x']},{m['y']}  {m['w']}x{m['h']}  color {m['ref_color']}"
-        except Exception:
-            return "Marker: (couldn't read popup_marker.json)"
-    return "Marker: not set"
-
-
 class CastWindow:
     """The cast list for the current game — a separate window on purpose.
 
@@ -450,6 +478,13 @@ class CastWindow:
     def __init__(self, app):
         self.app = app
         self.win = tk.Toplevel(app.root)
+        # Passing app.root as the master above only makes it this window's
+        # LOGICAL Tk parent -- it does NOT set the WM_TRANSIENT_FOR hint a
+        # window manager actually uses to treat this as owned by the main
+        # window (grouped with it in the taskbar/switcher, raised and
+        # minimized together, kept above it). transient() is what sets
+        # that hint; see _show_dialog()'s own use of it for the same reason.
+        self.win.transient(app.root)
         self.win.title("Cast")
         self.win.geometry("760x480")
         self.win.minsize(640, 280)
@@ -524,6 +559,7 @@ class CastWindow:
             "Characters already in the cast are unaffected; this only stops new arrivals.",
             title="Freeze adding new cast members", side="left")
 
+
         self.hint_var = tk.StringVar(value="")
         ttk.Label(
             self.win, padding=(10, 0, 10, 6), justify="left", wraplength=520,
@@ -592,32 +628,32 @@ class CastWindow:
             row.pack(fill="x")
             ttk.Label(row, text="Model:").pack(side="left")
             ttk.Label(row, textvariable=self.app.piper_model_display_var).pack(side="left", padx=(4, 8))
-            ttk.Button(row, text="Browse…", command=self._on_browse_piper_model).pack(side="left")
+            ttk.Button(row, text="Browse", command=self._on_browse_piper_model).pack(side="left")
         elif engine == "kokoro":
             row1 = ttk.Frame(self.model_area)
             row1.pack(fill="x")
             ttk.Label(row1, text="Model:").pack(side="left")
             ttk.Label(row1, textvariable=self.app.kokoro_model_display_var).pack(side="left", padx=(4, 8))
-            ttk.Button(row1, text="Browse…", command=self._on_browse_kokoro_model).pack(side="left")
+            ttk.Button(row1, text="Browse", command=self._on_browse_kokoro_model).pack(side="left")
             row2 = ttk.Frame(self.model_area)
             row2.pack(fill="x", pady=(4, 0))
             ttk.Label(row2, text="Voices:").pack(side="left")
             ttk.Label(row2, textvariable=self.app.kokoro_voices_display_var).pack(side="left", padx=(4, 8))
-            ttk.Button(row2, text="Browse…", command=self._on_browse_kokoro_voices).pack(side="left")
+            ttk.Button(row2, text="Browse", command=self._on_browse_kokoro_voices).pack(side="left")
         # espeak-ng and Windows Native have no model file -- nothing to show.
 
     def _on_browse_piper_model(self):
-        self.app._on_browse_piper_model()
+        self.app._on_browse_piper_model(parent=self.win)
         self.app._save_settings()
         self.refresh()
 
     def _on_browse_kokoro_model(self):
-        self.app._on_browse_kokoro_model()
+        self.app._on_browse_kokoro_model(parent=self.win)
         self.app._save_settings()
         self.refresh()
 
     def _on_browse_kokoro_voices(self):
-        self.app._on_browse_kokoro_voices()
+        self.app._on_browse_kokoro_voices(parent=self.win)
         self.app._save_settings()
         self.refresh()
 
@@ -651,7 +687,7 @@ class CastWindow:
         key = gp.model_key(
             engine,
             piper_model=self.app.piper_model_var.get().strip() or None,
-            kokoro_model=self.app.kokoro_model_var.get().strip() or None,
+            kokoro_voices=self.app.kokoro_voices_var.get().strip() or None,
         )
 
         is_active = engine == (self.app.settings.get("engine") or self.app._last_engine)
@@ -793,15 +829,15 @@ class CastWindow:
         speed_entry.bind("<FocusOut>", commit)
         speed_entry.bind("<Return>", commit)
 
-        ttk.Button(row, text="🔊", width=3,
+        ttk.Button(row, text="🔊", width=3, style="Compact.TButton",
                    command=lambda e=entry: self.app._speak_sample(e, key)).pack(side="left")
 
         # The Narrator is a reserved slot -- Cast.__init__ recreates it the
         # moment it's gone -- so removing it would only reappear, with
         # nothing assigned again. Simplest to just not offer it here.
         if entry["name"] != gp.NARRATOR:
-            ttk.Button(row, text="🗑", width=3,
-                       command=lambda e=entry: self._remove(e)).pack(side="left")
+            ttk.Button(row, text="✕", width=2, style="Compact.TButton",
+                       command=lambda e=entry: self._remove(e)).pack(side="left", padx=(6, 0))
 
         self._rows.append((entry, primary_var, speed_var))
 
@@ -818,6 +854,167 @@ class CastWindow:
         if profile.cast.remove(entry["name"]):
             profile.save_if_dirty()
             self.refresh()
+
+
+class OcrCorrectionsWindow:
+    """Editor for a profile's "ocr_corrections" -- fixes for an OCR glyph
+    confusion specific to THIS game's own font (see
+    game_profile.apply_ocr_corrections() and the module docstring's note
+    on why this is a per-GAME concern). Deliberately a separate window
+    from Cast: these rules apply to the raw OCR'd text before speaker
+    detection even runs, so they're just as relevant with no cast (or no
+    name region at all) configured -- they aren't casting, and living in
+    a window titled "Cast" would say otherwise."""
+
+    def __init__(self, app):
+        self.app = app
+        self.win = tk.Toplevel(app.root)
+        self.win.transient(app.root)
+        self.win.title("OCR Corrections")
+        self.win.geometry("620x440")
+        self.win.minsize(520, 320)
+        self._rows = []  # list of (row_frame, pattern_var, replace_var)
+
+        header = ttk.Frame(self.win, padding=(10, 8, 10, 4))
+        header.pack(fill="x")
+        self.title_var = tk.StringVar(value="")
+        ttk.Label(header, textvariable=self.title_var, font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        self.app._add_info_button(
+            header,
+            "Fixes for an OCR glyph confusion specific to THIS game's font -- e.g. an opening "
+            "quote mark fused against a capital \"I\" that reads as a bare \"T\". Each rule is a "
+            "regex matched against one whole OCR'd word at a time, not a substring search, so a "
+            "fix aimed at one misread can't accidentally clip a letter out of an unrelated real "
+            "word. These apply to the raw OCR text before speaker detection runs -- they aren't "
+            "part of the cast, and apply even with no cast configured at all. Use \\1, \\2 etc. in "
+            "Replace to refer back to a parenthesized group in Pattern.",
+            title="OCR corrections", side="right")
+
+        cols = ttk.Frame(self.win, padding=(10, 4, 10, 0))
+        cols.pack(fill="x")
+        ttk.Label(cols, text="Pattern (regex)", width=30).pack(side="left")
+        ttk.Label(cols, text="Replace").pack(side="left", padx=(8, 0))
+
+        outer = ttk.Frame(self.win, padding=(10, 0, 10, 4))
+        outer.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(outer, highlightthickness=0)
+        scroll = ttk.Scrollbar(outer, orient="vertical", command=self.canvas.yview)
+        self.body = ttk.Frame(self.canvas)
+        self.body.bind("<Configure>",
+                        lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self._window_id = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
+        self.canvas.bind("<Configure>",
+                          lambda e: self.canvas.itemconfigure(self._window_id, width=e.width))
+        self.canvas.configure(yscrollcommand=scroll.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        add_row = ttk.Frame(self.win, padding=(10, 0, 10, 4))
+        add_row.pack(fill="x")
+        ttk.Button(add_row, text="+ Add rule", command=lambda: self._add_row()).pack(side="left")
+
+        test_frame = ttk.LabelFrame(self.win, text="Try it", padding=(8, 6))
+        test_frame.pack(fill="x", padx=10, pady=(0, 4))
+        self.test_in_var = tk.StringVar(value="")
+        ttk.Entry(test_frame, textvariable=self.test_in_var).pack(fill="x")
+        self.test_in_var.trace_add("write", lambda *_: self._update_test())
+        self.test_out_var = tk.StringVar(value="")
+        ttk.Label(test_frame, textvariable=self.test_out_var, foreground="#555").pack(
+            fill="x", anchor="w", pady=(4, 0))
+
+        btn_row = ttk.Frame(self.win, padding=(10, 0, 10, 10))
+        btn_row.pack(fill="x")
+        ttk.Button(btn_row, text="Save", command=self._on_save).pack(side="right")
+        ttk.Button(btn_row, text="Close", command=self.close).pack(side="right", padx=(0, 6))
+
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+    def alive(self) -> bool:
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def close(self):
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        self.app.ocr_corrections_window = None
+
+    def _add_row(self, pattern="", replace=""):
+        row = ttk.Frame(self.body)
+        row.pack(fill="x", pady=2)
+        pattern_var = tk.StringVar(value=pattern)
+        replace_var = tk.StringVar(value=replace)
+        ttk.Entry(row, textvariable=pattern_var, width=30).pack(side="left")
+        ttk.Entry(row, textvariable=replace_var).pack(side="left", fill="x", expand=True, padx=(8, 0))
+        pattern_var.trace_add("write", lambda *_: self._update_test())
+        replace_var.trace_add("write", lambda *_: self._update_test())
+        ttk.Button(row, text="✕", width=2, style="Compact.TButton",
+                   command=lambda: self._remove_row(row)).pack(side="left", padx=(6, 0))
+        self._rows.append((row, pattern_var, replace_var))
+
+    def _remove_row(self, row):
+        self._rows = [r for r in self._rows if r[0] is not row]
+        row.destroy()
+        self._update_test()
+
+    def refresh(self):
+        if not self.alive():
+            return
+        profile = self.app.profile
+        for row, _, _ in self._rows:
+            row.destroy()
+        self._rows = []
+        if profile is None:
+            self.title_var.set("No profile loaded")
+            return
+        self.title_var.set(profile.name)
+        for c in profile.get("ocr_corrections") or []:
+            if isinstance(c, dict):
+                self._add_row(c.get("pattern", ""), c.get("replace", ""))
+        self._update_test()
+
+    def _current_corrections(self):
+        out = []
+        for _, pattern_var, replace_var in self._rows:
+            pattern, replace = pattern_var.get(), replace_var.get()
+            if pattern.strip() or replace.strip():
+                out.append({"pattern": pattern, "replace": replace})
+        return out
+
+    def _update_test(self):
+        sample = self.test_in_var.get()
+        if not sample:
+            self.test_out_var.set("")
+            return
+        try:
+            result = gp.apply_ocr_corrections(sample, self._current_corrections(), log=lambda *_: None)
+        except Exception as e:
+            result = f"(error: {e})"
+        self.test_out_var.set(f"→ {result}")
+
+    def _on_save(self):
+        profile = self.app.profile
+        if profile is None:
+            show_warning(self.win, "OCR corrections", "No profile loaded.")
+            return
+        corrections = self._current_corrections()
+        bad = []
+        for c in corrections:
+            try:
+                re.compile(c["pattern"])
+            except re.error as e:
+                bad.append((c["pattern"], str(e)))
+        if bad:
+            lines = "\n".join(f"- {pattern!r}: {err}" for pattern, err in bad[:5])
+            show_error(self.win, "OCR corrections",
+                       f"Couldn't save -- {len(bad)} pattern(s) don't compile as a regex:\n{lines}")
+            return
+        profile.set("ocr_corrections", corrections)
+        profile.save_if_dirty()
+        show_info(self.win, "OCR corrections", "Saved.")
 
 
 class TranscriptWindow:
@@ -850,6 +1047,13 @@ class TranscriptWindow:
     def __init__(self, app):
         self.app = app
         self.win = tk.Toplevel(app.root)
+        # See CastWindow.__init__'s comment on the same call: app.root above
+        # only makes it this window's logical Tk parent, not what the
+        # window manager treats as its owner -- transient() is what actually
+        # sets that (WM_TRANSIENT_FOR), and this window was already meant to
+        # behave like one of CastWindow's owned utility windows (see the
+        # "Keep on top" note in this class's docstring above).
+        self.win.transient(app.root)
         self.win.title("Transcript")
         self.win.geometry("520x420")
         self.win.minsize(320, 200)
@@ -928,12 +1132,93 @@ class TranscriptWindow:
         self.text.config(state="disabled")
 
 
+class LicensesWindow:
+    """Read-only viewer for THIRD_PARTY_LICENSES.md, opened from the
+    "Licenses" button in the main window's Game row (see App._build_ui's
+    game_row and _open_licenses_window). Exists so the licensing info this
+    project
+    needs to make available travels with the app itself, not just as a
+    file someone has to go find in the repo -- especially important for a
+    built .exe handed to someone who never sees the source tree at all
+    (see that file's "GPL-3.0 components" section for why that matters).
+
+    Deliberately a plain, undecorated text viewer -- no editing, no "Keep
+    on top" (this isn't meant to sit over a running game the way
+    CastWindow/OcrCorrectionsWindow/TranscriptWindow are), just something
+    to open, read, and close."""
+
+    def __init__(self, app):
+        self.app = app
+        self.win = tk.Toplevel(app.root)
+        self.win.transient(app.root)
+        self.win.title("Licenses")
+        self.win.geometry("640x520")
+        self.win.minsize(360, 260)
+
+        header = ttk.Frame(self.win, padding=(10, 8, 10, 4))
+        header.pack(fill="x")
+        ttk.Label(header, text="Licenses", font=("TkDefaultFont", 10, "bold")).pack(side="left")
+        ttk.Button(header, text="Close", command=self.win.destroy).pack(side="right")
+
+        text_frame = ttk.Frame(self.win, padding=(10, 0, 10, 10))
+        text_frame.pack(fill="both", expand=True)
+        self.text = scrolledtext.ScrolledText(text_frame, state="normal", wrap="word")
+        self.text.pack(fill="both", expand=True)
+        self.text.insert("1.0", self._load_text())
+        self.text.config(state="disabled")
+
+    def _load_text(self) -> str:
+        # Same Path(__file__).with_name(...) convention gui_settings.json
+        # already relies on elsewhere in this file -- resolves next to
+        # gui.py in a normal checkout, and next to the built .exe once
+        # frozen, which is exactly where the README tells people to copy
+        # these two files alongside the .exe before sharing it.
+        notices_path = Path(__file__).with_name("THIRD_PARTY_LICENSES.md")
+        license_path = Path(__file__).with_name("LICENSE")
+        parts = []
+        try:
+            parts.append(notices_path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            parts.append(
+                "Couldn't read THIRD_PARTY_LICENSES.md next to this program "
+                f"({exc}).\n\nIf this is a built .exe, make sure that file was "
+                "copied alongside it -- see the README's \"Building a "
+                "standalone .exe\" section."
+            )
+        if not license_path.exists():
+            parts.append(
+                "\n\n---\n\nNote: LICENSE (this project's own GPL-3.0 text) "
+                "wasn't found alongside this program either."
+            )
+        return "\n".join(parts)
+
+    def alive(self) -> bool:
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def close(self):
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
 class App:
     def __init__(self, root):
         self.root = root
         root.title("Game Text Speaker")
         root.geometry("620x700")
         root.minsize(520, 560)
+
+        # ttk's default button padding makes even a tiny icon/glyph-only
+        # button (an info bubble, a per-row "✕" delete, Cast's "🔊" test
+        # button) noticeably taller than the Entry/Combobox fields it sits
+        # beside in the same row. This style trims that padding down so
+        # those small buttons line up at the same height instead of
+        # sticking up above the row.
+        ttk.Style(root).configure("Compact.TButton", padding=0)
 
         self.log_queue = queue.Queue()
         self.stop_event = None
@@ -948,6 +1233,8 @@ class App:
         self.profile = None
         self.cast_window = None
         self.transcript_window = None
+        self.ocr_corrections_window = None
+        self.licenses_window = None
         self._live_speaker = None   # set while running, for the reader's own speech
         self._preview_speakers = {}  # _preview_key(engine) -> Speaker, for Cast's Test button (see _speak_sample)
         self._preview_loading = set()  # _preview_key(engine) values currently being built, to dedupe clicks
@@ -1022,17 +1309,20 @@ class App:
 
     # ---------------- UI construction ----------------
 
-    def _add_info_button(self, parent, text: str, title: str = "Info", side: str = "left"):
-        """Small circled-i button that pops up `text` in a dialog when
+    def _add_info_button(self, parent, text: str, title: str = "Info", side: str = "left", extra=None):
+        """Small circle-i button that pops up `text` in a dialog when
         clicked. Used instead of an always-visible wrapped hint label under
         a field -- keeps the explanation one click away without it
         permanently taking up window height. `side` controls which edge of
         `parent` it packs against, so it can either sit right next to the
         field it explains (the default) or be pinned to a corner (e.g. a
-        section's top-right)."""
+        section's top-right). `extra`, if given, is an (label, command)
+        pair added as a second button on the popup -- see _show_dialog()."""
         padx = (4, 0) if side == "left" else (0, 4)
-        ttk.Button(parent, text="ⓘ", width=2,
-                   command=lambda: show_info(parent, title, text)).pack(side=side, padx=padx)
+        btn = ttk.Button(parent, image=_info_icon(), style="Compact.TButton",
+                          command=lambda: show_info(parent, title, text, extra=extra))
+        btn.image = _info_icon()  # keep a reference so Tk doesn't GC it (see _info_icon())
+        btn.pack(side=side, padx=padx)
 
     def _build_ui(self):
         pad = {"padx": 6, "pady": 4}
@@ -1044,27 +1334,28 @@ class App:
         game_frame = ttk.LabelFrame(self.root, text="Game")
         game_frame.pack(fill="x", **pad)
         game_row = ttk.Frame(game_frame)
-        game_row.pack(fill="x", padx=6, pady=6)
+        game_row.pack(fill="x", padx=6, pady=(6, 4))
         ttk.Label(game_row, text="Profile:").pack(side="left")
         self.profile_var = tk.StringVar(value="")
         self.profile_combo = ttk.Combobox(game_row, textvariable=self.profile_var,
-                                          values=[], width=24, state="readonly")
-        self.profile_combo.pack(side="left", padx=(4, 6))
+                                          values=[], width=40, state="readonly")
+        self.profile_combo.pack(side="left", padx=(4, 6), fill="x", expand=True)
         self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
-        self._add_info_button(
-            game_row,
-            "A profile holds everything specific to one game: the dialogue region, the "
-            "polling/similarity settings, how that game marks who's speaking, and the "
-            "cast of characters it has met.\n\n"
-            "Profiles live in the 'profiles' folder, one .json each, and are meant to be "
-            "shared — they deliberately contain no file paths and no voice names, only "
-            "'this character is male #0'. Your own settings say what male #0 sounds like "
-            "on the engine you run, so a profile still works for someone using a "
-            "different engine entirely.",
-            title="Game profiles", side="right")
-        ttk.Button(game_row, text="Cast…", command=self._open_cast_window).pack(side="right", padx=(0, 4))
-        ttk.Button(game_row, text="Transcript…", command=self._open_transcript_window).pack(side="right", padx=(0, 4))
-        ttk.Button(game_row, text="New…", command=self._on_new_profile).pack(side="right", padx=(0, 4))
+        ttk.Button(game_row, text="Licenses", command=self._open_licenses_window).pack(side="right")
+
+        # Second row, just for the profile action buttons -- keeps this
+        # LabelFrame from getting too wide for the window at default size
+        # now that there are five of them alongside the dropdown above.
+        # Left-aligned (unlike the rest of this app's rows) so they read as
+        # a toolbar right under the dropdown they act on, in plain
+        # left-to-right order: New, Import, Export, Transcript, Cast.
+        actions_row = ttk.Frame(game_frame)
+        actions_row.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Button(actions_row, text="New", command=self._on_new_profile).pack(side="left", padx=(0, 4))
+        ttk.Button(actions_row, text="Import", command=self._on_import_shared).pack(side="left", padx=(0, 4))
+        ttk.Button(actions_row, text="Export", command=self._on_export_shared).pack(side="left", padx=(0, 4))
+        ttk.Button(actions_row, text="Transcript", command=self._open_transcript_window).pack(side="left", padx=(0, 4))
+        ttk.Button(actions_row, text="Cast", command=self._open_cast_window).pack(side="left", padx=(0, 4))
 
         region_frame = ttk.LabelFrame(self.root, text="1. Dialogue region")
         region_frame.pack(fill="x", **pad)
@@ -1081,10 +1372,10 @@ class App:
         region_row.pack(fill="x")
         self.region_status_label = ttk.Label(region_row, text="")
         self.region_status_label.pack(side="left", padx=6, pady=6)
-        btn = ttk.Button(region_row, text="From Screenshot…", command=self._on_select_region_from_image)
+        btn = ttk.Button(region_row, text="From Screenshot", command=self._on_select_region_from_image)
         btn.pack(side="right", padx=6, pady=6)
         self._action_buttons.append(btn)
-        btn = ttk.Button(region_row, text="Select Region…", command=self._on_select_region)
+        btn = ttk.Button(region_row, text="Select Region", command=self._on_select_region)
         btn.pack(side="right", padx=6, pady=6)
         self._action_buttons.append(btn)
 
@@ -1098,10 +1389,10 @@ class App:
         name_region_row.pack(fill="x", padx=6, pady=(0, 4))
         self.name_region_status_label = ttk.Label(name_region_row, text="")
         self.name_region_status_label.pack(side="left")
-        btn = ttk.Button(name_region_row, text="From Screenshot…", command=self._on_select_name_region_from_image)
+        btn = ttk.Button(name_region_row, text="From Screenshot", command=self._on_select_name_region_from_image)
         btn.pack(side="right")
         self._action_buttons.append(btn)
-        btn = ttk.Button(name_region_row, text="Select Name Region…", command=self._on_select_name_region)
+        btn = ttk.Button(name_region_row, text="Select Name Region", command=self._on_select_name_region)
         btn.pack(side="right", padx=(0, 4))
         self._action_buttons.append(btn)
 
@@ -1111,7 +1402,7 @@ class App:
         top_row.pack(fill="x", padx=6, pady=(6, 0))
         self.popup_status_label = ttk.Label(top_row, text="")
         self.popup_status_label.pack(side="left")
-        btn = ttk.Button(top_row, text="Select Popup Marker…", command=self._on_select_popup_marker)
+        btn = ttk.Button(top_row, text="Select Popup Marker", command=self._on_select_popup_marker)
         btn.pack(side="right")
         self._action_buttons.append(btn)
 
@@ -1301,6 +1592,15 @@ class App:
             "text exactly as OCR'd.",
             title="Speaker name",
         )
+        # A profile-specific glyph-confusion fix -- e.g. an opening quote
+        # fused against a capital "I" into what a particular game's font
+        # reads as a bare "T" -- applies to the raw OCR text before speaker
+        # detection even runs, so it lives here with the rest of the OCR
+        # pipeline's settings, deliberately NOT in the Cast window: it has
+        # nothing to do with casting and applies even with no cast at all.
+        # See game_profile.apply_ocr_corrections().
+        ttk.Button(self.speaker_name_row, text="OCR Corrections",
+                   command=self._open_ocr_corrections_window).pack(side="right")
 
         self._update_ocr_engine_widgets()
 
@@ -1401,49 +1701,34 @@ class App:
     # ---------------- status labels ----------------
 
     def _refresh_region_status(self):
-        """Purely display. Shows the ACTIVE PROFILE's region rather than
-        region.json's, because that's what the reader will actually watch.
-
-        Deliberately does NOT copy region.json into the profile -- that file
-        holds whatever was selected last, which belongs to whichever game was
-        open at the time. Adopting it here meant switching to a brand-new
-        profile silently inherited the previous game's box. Adoption happens
-        only in _adopt_selected_region(), on the paths where the user has just
-        actually dragged one."""
-        if self.profile is not None:
-            region = self.profile.get("region")
-            if region:
-                self.region_status_label.config(
-                    text=f"Region set: {region['x']},{region['y']}  {region['w']}x{region['h']}")
-            else:
-                self.region_status_label.config(text="Region: not set for this profile yet")
+        """Purely display. self.profile always exists by the time the main
+        window is up (see _load_active_profile()) except on the rare path
+        where even the starter profile couldn't be created -- guarded here
+        rather than everywhere that calls this."""
+        if self.profile is None:
+            self.region_status_label.config(text="Region: (no profile loaded)")
             return
-        self.region_status_label.config(text=_region_status_text())
+        region = self.profile.get("region")
+        if region:
+            self.region_status_label.config(
+                text=f"Region set: {region['x']},{region['y']}  {region['w']}x{region['h']}")
+        else:
+            self.region_status_label.config(text="Region: not set for this profile yet")
 
-    def _adopt_selected_region(self):
-        """Called after the user picks a region. The selection UI writes
-        region.json (that path is shared with the CLI); this is where it
-        becomes THIS game's region instead of a global one."""
-        if self.profile is not None:
-            try:
-                if core.CONFIG_PATH.exists():
-                    picked = json.loads(core.CONFIG_PATH.read_text())
-                    if picked:
-                        self.profile.set("region", picked)
-                        self.profile.save_if_dirty()
-            except Exception as e:
-                self.log(f"[profile] Couldn't save the region to this profile: {e}")
+    def _adopt_selected_region(self, picked=None):
+        """Called after the user picks a region, with the picker's return
+        value passed straight through -- nothing round-trips through a file
+        anymore, so there's nothing here to clobber between games."""
+        if picked and self.profile is not None:
+            self.profile.set("region", picked)
+            self.profile.save_if_dirty()
         self._refresh_region_status()
 
     def _refresh_name_region_status(self):
         """Purely display -- same idea as _refresh_region_status(), but for
-        the profile's name_region (see game_profile.py's detect_speaker()).
-        There's no global fallback file for this one the way region.json
-        covers the profile-less CLI case: without a profile there is no
-        name region, full stop, since character detection is a profile
-        concept end to end."""
+        the profile's name_region (see game_profile.py's detect_speaker())."""
         if self.profile is None:
-            self.name_region_status_label.config(text="Name region: (create or choose a game profile first)")
+            self.name_region_status_label.config(text="Name region: (no profile loaded)")
             return
         region = self.profile.get("name_region")
         if region:
@@ -1453,35 +1738,30 @@ class App:
             self.name_region_status_label.config(
                 text="Name region: not set (every line reads as Narrator)")
 
-    def _adopt_selected_name_region(self):
+    def _adopt_selected_name_region(self, picked=None):
         """Called after the user picks a name region -- mirrors
-        _adopt_selected_region(), reading back NAME_REGION_CONFIG_PATH
-        instead of CONFIG_PATH so the two picks never clobber each other,
-        even when done back to back."""
-        if self.profile is not None:
-            try:
-                if core.NAME_REGION_CONFIG_PATH.exists():
-                    picked = json.loads(core.NAME_REGION_CONFIG_PATH.read_text())
-                    if picked:
-                        self.profile.set("name_region", picked)
-                        self.profile.save_if_dirty()
-            except Exception as e:
-                self.log(f"[profile] Couldn't save the name region to this profile: {e}")
+        _adopt_selected_region()."""
+        if picked and self.profile is not None:
+            self.profile.set("name_region", picked)
+            self.profile.save_if_dirty()
         self._refresh_name_region_status()
 
     def _refresh_popup_status(self):
-        self.popup_status_label.config(text=_popup_status_text())
+        if self.profile is None:
+            self.popup_status_label.config(text="Marker: (no profile loaded)")
+            return
+        marker = self.profile.get("popup_marker")
+        if marker:
+            self.popup_status_label.config(
+                text=f"Marker set: {marker['x']},{marker['y']}  {marker['w']}x{marker['h']}  "
+                     f"color {marker['ref_color']}")
+        else:
+            self.popup_status_label.config(text="Marker: not set")
 
-    def _adopt_selected_popup_marker(self):
-        if self.profile is not None:
-            try:
-                if core.POPUP_MARKER_PATH.exists():
-                    picked = json.loads(core.POPUP_MARKER_PATH.read_text())
-                    if picked:
-                        self.profile.set("popup_marker", picked)
-                        self.profile.save_if_dirty()
-            except Exception as e:
-                self.log(f"[profile] Couldn't save the popup marker to this profile: {e}")
+    def _adopt_selected_popup_marker(self, picked=None):
+        if picked and self.profile is not None:
+            self.profile.set("popup_marker", picked)
+            self.profile.save_if_dirty()
         self._refresh_popup_status()
 
     # ---------------- logging (thread-safe: workers push, main thread drains) ----------------
@@ -1546,11 +1826,10 @@ class App:
     def _load_active_profile(self):
         """Pick up the profile named in settings, or make one.
 
-        First run after this feature landed there won't be any profiles, but
-        there very likely IS a region.json and maybe a popup_marker.json left
-        from before. Those were always game-specific settings that simply had
-        nowhere game-specific to live, so they get folded into a starter
-        profile rather than abandoned."""
+        First run after this feature landed there won't be any profiles yet,
+        so a "Default" one gets created automatically -- there's nothing
+        older to fold in anymore now that region/marker selections never
+        touch disk outside of a profile."""
         gp.PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         wanted = (self.settings.get("profile") or "").strip()
         if wanted:
@@ -1573,20 +1852,9 @@ class App:
                 self.log(f"[profile] Couldn't read {existing[0][1].name}: {e}")
                 self.profile = None
         else:
-            region = popup = None
             try:
-                if core.CONFIG_PATH.exists():
-                    region = json.loads(core.CONFIG_PATH.read_text())
-                if core.POPUP_MARKER_PATH.exists():
-                    popup = json.loads(core.POPUP_MARKER_PATH.read_text())
-            except Exception:
-                pass
-            try:
-                self.profile = gp.migrate_legacy(self.settings, region=region,
-                                                 popup_marker=popup, name="My Game")
-                if region or popup:
-                    self.log("[profile] Moved your existing region/marker settings into "
-                             f"profiles/{self.profile.path.name} — they're per-game now.")
+                self.profile = gp.create_profile("Default")
+                self.log(f"[profile] Created a starter profile: profiles/{self.profile.path.name}.")
             except OSError as e:
                 self.log(f"[profile] Couldn't create a starter profile: {e}")
                 self.profile = None
@@ -1647,6 +1915,61 @@ class App:
         self._refresh_region_status()
         self._refresh_name_region_status()
 
+    def _shared_dir(self):
+        d = gp.PROFILE_DIR / gp.SHARED_EXPORT_DIRNAME
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _on_export_shared(self):
+        if self.profile is None:
+            show_warning(self.root, "Export", "No profile loaded.")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export cast + OCR corrections",
+            initialdir=str(self._shared_dir()),
+            initialfile=f"{gp.slugify(self.profile.name)}-shared.json",
+            defaultextension=".json",
+            filetypes=[("Shared profile files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.profile.export_shared(path)
+        except OSError as e:
+            show_error(self.root, "Export", f"Couldn't write {path}:\n{e}")
+            return
+        cast_count = len(self.profile.cast.to_json())
+        corr_count = len(self.profile.get("ocr_corrections") or [])
+        show_info(self.root, "Export",
+                  f"Exported {cast_count} character(s) and {corr_count} OCR correction(s) to:\n{path}")
+
+    def _on_import_shared(self):
+        if self.profile is None:
+            show_warning(self.root, "Import", "No profile loaded.")
+            return
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Import cast + OCR corrections",
+            initialdir=str(self._shared_dir()),
+            filetypes=[("Shared profile files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            cast_added, cast_updated, corr_added = self.profile.import_shared(path)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            show_error(self.root, "Import", f"Couldn't import {path}:\n{e}")
+            return
+        self.profile.save_if_dirty()
+        if self.cast_window is not None and self.cast_window.alive():
+            self.cast_window.refresh()
+        if self.ocr_corrections_window is not None and self.ocr_corrections_window.alive():
+            self.ocr_corrections_window.refresh()
+        show_info(self.root, "Import",
+                  f"Added {cast_added} new character(s), updated {cast_updated} existing. "
+                  f"Added {corr_added} new OCR correction(s).")
+
     def _on_new_speaker_ui(self, name):
         """A character has just spoken for the first time. Deliberately
         interrupts nothing -- they've already said that line in whatever this
@@ -1664,11 +1987,26 @@ class App:
         self.cast_window.refresh(highlight=highlight)
 
     def _open_transcript_window(self):
-        # No profile required -- even profile-less runs still detect and
-        # speak lines (see game_text_speaker.run()), so there's still
-        # something useful to show here.
+        # No profile required here specifically -- this window just shows
+        # whatever's been said so far, which self.profile being None (a
+        # failed profile creation, see _load_active_profile()) doesn't
+        # prevent.
         if self.transcript_window is None or not self.transcript_window.alive():
             self.transcript_window = TranscriptWindow(self)
+
+    def _open_licenses_window(self):
+        # No profile required -- this is app-wide info, not tied to any
+        # particular game (see LicensesWindow's docstring).
+        if self.licenses_window is None or not self.licenses_window.alive():
+            self.licenses_window = LicensesWindow(self)
+
+    def _open_ocr_corrections_window(self):
+        if self.profile is None:
+            show_info(self.root, "No profile", "Create or choose a game profile first.")
+            return
+        if self.ocr_corrections_window is None or not self.ocr_corrections_window.alive():
+            self.ocr_corrections_window = OcrCorrectionsWindow(self)
+        self.ocr_corrections_window.refresh()
 
     def _preview_key(self, engine):
         """Identifies a specific, loadable speech configuration for
@@ -1756,12 +2094,13 @@ class App:
                   "your cursor stays armed to drag a box even once the game is focused.")
 
         def worker():
+            picked = None
             try:
-                core.select_region(log=self.log)
+                picked = core.select_region(log=self.log)
             except (SystemExit, Exception) as e:
                 self.log(f"Error: {e}")
             finally:
-                self.log_queue.put(("action_done", self._adopt_selected_region))
+                self.log_queue.put(("action_done", lambda: self._adopt_selected_region(picked)))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1772,49 +2111,45 @@ class App:
         )
         if not path:
             return
+        picked = None
         try:
-            core.select_region_from_image(path, master=self.root, log=self.log)
+            picked = core.select_region_from_image(path, master=self.root, log=self.log)
         except Exception as e:
             self.log(f"Error: {e}")
             show_error(self.root, "Selection failed", str(e))
-        self._adopt_selected_region()
+        self._adopt_selected_region(picked)
 
     def _on_select_name_region(self):
-        if self.profile is None:
-            show_info(self.root, "No profile", "Create or choose a game profile first.")
-            return
         self._set_actions_enabled(False)
         self.log("Select Name Region: click the button, then Alt+Tab back to the game — "
                   "drag a box around wherever the speaker's name shows (its own nameplate, "
                   "or the dialogue box itself if the name runs into the text there).")
 
         def worker():
+            picked = None
             try:
-                core.select_region(log=self.log, target_path=core.NAME_REGION_CONFIG_PATH)
+                picked = core.select_region(log=self.log)
             except (SystemExit, Exception) as e:
                 self.log(f"Error: {e}")
             finally:
-                self.log_queue.put(("action_done", self._adopt_selected_name_region))
+                self.log_queue.put(("action_done", lambda: self._adopt_selected_name_region(picked)))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_select_name_region_from_image(self):
-        if self.profile is None:
-            show_info(self.root, "No profile", "Create or choose a game profile first.")
-            return
         path = filedialog.askopenfilename(
             title="Select a screenshot with the character's name visible",
             filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")],
         )
         if not path:
             return
+        picked = None
         try:
-            core.select_region_from_image(path, master=self.root, log=self.log,
-                                           target_path=core.NAME_REGION_CONFIG_PATH)
+            picked = core.select_region_from_image(path, master=self.root, log=self.log)
         except Exception as e:
             self.log(f"Error: {e}")
             show_error(self.root, "Selection failed", str(e))
-        self._adopt_selected_name_region()
+        self._adopt_selected_name_region(picked)
 
     def _on_select_popup_marker(self):
         self._set_actions_enabled(False)
@@ -1822,17 +2157,28 @@ class App:
                   "and drag a small box over a spot unique to the popup.")
 
         def worker():
+            picked = None
             try:
-                core.select_popup_marker(log=self.log)
+                picked = core.select_popup_marker(log=self.log)
             except (SystemExit, Exception) as e:
                 self.log(f"Error: {e}")
             finally:
-                self.log_queue.put(("action_done", self._adopt_selected_popup_marker))
+                self.log_queue.put(("action_done", lambda: self._adopt_selected_popup_marker(picked)))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_browse_piper_model(self):
+    def _on_browse_piper_model(self, parent=None):
+        # `parent` ties the native file dialog to whichever window its
+        # Browse button actually lives in -- currently always the Cast
+        # window (see CastWindow._on_browse_piper_model()), which passes
+        # its own self.win. Without an explicit parent, tkinter falls back
+        # to the hidden default root, which has no fixed screen position of
+        # its own -- so the dialog would show up wherever that happens to
+        # land instead of near the button that opened it. Defaulting to
+        # self.root here just means "the main window" if this is ever
+        # called with no parent at all.
         path = filedialog.askopenfilename(
+            parent=parent or self.root,
             title="Select a Piper voice model",
             filetypes=[("Piper voice model", "*.onnx"), ("All files", "*.*")],
         )
@@ -1840,8 +2186,9 @@ class App:
             self.piper_model_var.set(path)
             self.piper_model_display_var.set(_basename_or_placeholder(path))
 
-    def _on_browse_kokoro_model(self):
+    def _on_browse_kokoro_model(self, parent=None):
         path = filedialog.askopenfilename(
+            parent=parent or self.root,
             title="Select Kokoro's model file (kokoro-v1.0.onnx)",
             filetypes=[("Kokoro model", "*.onnx"), ("All files", "*.*")],
         )
@@ -1849,8 +2196,9 @@ class App:
             self.kokoro_model_var.set(path)
             self.kokoro_model_display_var.set(_basename_or_placeholder(path))
 
-    def _on_browse_kokoro_voices(self):
+    def _on_browse_kokoro_voices(self, parent=None):
         path = filedialog.askopenfilename(
+            parent=parent or self.root,
             title="Select Kokoro's voices file (voices-v1.0.bin)",
             filetypes=[("Kokoro voices", "*.bin"), ("All files", "*.*")],
         )
@@ -1864,14 +2212,18 @@ class App:
     # ---------------- run / stop ----------------
 
     def _on_start(self):
-        if not core.CONFIG_PATH.exists():
+        if self.profile is None:
+            show_warning(self.root, "No profile", "No game profile is loaded -- see the log above "
+                         "for why the starter profile couldn't be created.")
+            return
+        if not self.profile.get("region"):
             show_warning(self.root, "No region set", "Select a dialogue region first (step 1).")
             return
 
         settings = self._collect_settings()
         self._save_settings()
 
-        if settings["ignore_popups"] and not core.POPUP_MARKER_PATH.exists():
+        if settings["ignore_popups"] and not self.profile.get("popup_marker"):
             show_warning(
                 self.root, "No popup marker",
                 "'Ignore popups' is checked but no popup marker is saved yet. "

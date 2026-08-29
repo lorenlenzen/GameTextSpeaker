@@ -1,0 +1,231 @@
+{
+  "schema": "game-text-speaker-cast",
+  "game": "Life-and-Suffering-of-Sir-Brante",
+  "cast": [
+    {
+      "name": "Narrator",
+      "models": {
+        "piper:en_US-libritts-high": {
+          "speaker": 7
+        },
+        "kokoro:kokoro-v1.0": {
+          "voice": "af_heart"
+        },
+        "piper:en_US-lessac-high": {
+          "speaker": 0
+        },
+        "kokoro:kokoro-quant-gpu": {
+          "voice": "af_heart"
+        },
+        "kokoro:kokoro-v1.0.int8": {
+          "voice": "af_heart"
+        },
+        "kokoro:voices-v1.0": {
+          "voice": "af_heart"
+        }
+      }
+    },
+    {
+      "name": "Tommas Guerro",
+      "models": {
+        "piper:en_US-libritts-high": {
+          "speaker": 338
+        },
+        "kokoro:kokoro-v1.0": {
+          "voice": "am_fenrir"
+        },
+        "piper:en_US-hfc_male-medium": {
+          "speaker": 0
+        },
+        "kokoro:kokoro-quant-gpu": {
+          "voice": "am_eric"
+        },
+        "kokoro:kokoro-v1.0.int8": {
+          "voice": "am_eric"
+        },
+        "kokoro:voices-v1.0": {
+          "voice": "am_puck"
+        }
+      }
+    },
+    {
+      "name": "Patriarch Luke",
+      "models": {
+        "kokoro:kokoro-v1.0": {
+          "voice": "em_alex"
+        },
+        "piper:en_US-libritts-high": {
+          "speaker": 231,
+          "speed": 1.2
+        },
+        "kokoro:kokoro-quant-gpu": {
+          "voice": "em_alex"
+        },
+        "kokoro:kokoro-v1.0.int8": {
+          "voice": "em_alex"
+        },
+        "kokoro:voices-v1.0": {
+          "voice": "bm_daniel"
+        }
+      }
+    },
+    {
+      "name": "Father Ulrich",
+      "models": {
+        "kokoro:kokoro-v1.0": {
+          "voice": "em_santa"
+        },
+        "kokoro:kokoro-quant-gpu": {
+          "voice": "em_santa"
+        },
+        "kokoro:kokoro-v1.0.int8": {
+          "voice": "em_santa"
+        },
+        "kokoro:voices-v1.0": {
+          "voice": "bm_fable"
+        },
+        "piper:en_US-libritts-high": {
+          "speaker": 704
+        }
+      }
+    },
+    {
+      "name": "Robert Brante",
+      "models": {
+        "kokoro:kokoro-quant-gpu": {
+          "voice": "am_echo"
+        },
+        "kokoro:kokoro-v1.0.int8": {
+          "voice": "am_echo"
+        },
+        "kokoro:voices-v1.0": {
+          "voice": "am_onyx"
+        },
+        "piper:en_US-libritts-high": {
+          "speaker": 566
+        }
+      }
+    },
+    {
+      "name": "Lydia Brante",
+      "models": {
+        "kokoro:kokoro-quant-gpu": {
+          "voice": "af_jessica"
+        },
+        "kokoro:kokoro-v1.0.int8": {
+          "voice": "af_jessica"
+        },
+        "kokoro:voices-v1.0": {
+          "voice": "af_bella"
+        },
+        "piper:en_US-libritts-high": {
+          "speaker": 0
+        }
+      }
+    },
+    {
+      "name": "Stephan Brante",
+      "models": {
+        "kokoro:kokoro-quant-gpu": {
+          "voice": "am_michael"
+        },
+        "kokoro:kokoro-v1.0.int8": {
+          "voice": "am_michael"
+        },
+        "kokoro:voices-v1.0": {
+          "voice": "am_fenrir",
+          "speed": 1.2
+        },
+        "piper:en_US-libritts-high": {
+          "speaker": 429
+        }
+      }
+    },
+    {
+      "name": "Gregor Brante",
+      "models": {
+        "kokoro:kokoro-quant-gpu": {
+          "voice": "bm_george"
+        },
+        "kokoro:kokoro-v1.0.int8": {
+          "voice": "bm_george"
+        },
+        "kokoro:voices-v1.0": {
+          "voice": "pm_santa"
+        },
+        "piper:en_US-libritts-high": {
+          "speaker": 199
+        }
+      }
+    },
+    {
+      "name": "Jeremiah Haag",
+      "models": {
+        "kokoro:kokoro-v1.0.int8": {
+          "voice": "hm_omega"
+        },
+        "kokoro:voices-v1.0": {
+          "voice": "bm_lewis"
+        },
+        "piper:en_US-libritts-high": {
+          "speaker": 291
+        }
+      }
+    },
+    {
+      "name": "Sophia",
+      "models": {
+        "kokoro:voices-v1.0": {
+          "voice": "bf_isabella"
+        },
+        "piper:en_US-libritts-high": {
+          "speaker": 138
+        }
+      }
+    },
+    {
+      "name": "Aegerius Monrogue",
+      "models": {
+        "kokoro:voices-v1.0": {
+          "voice": "im_nicola"
+        },
+        "piper:en_US-libritts-high": {
+          "speaker": 367
+        }
+      }
+    },
+    {
+      "name": "Octavia Milanidas",
+      "models": {
+        "piper:en_US-libritts-high": {
+          "speaker": 9
+        },
+        "kokoro:voices-v1.0": {
+          "voice": "bf_lily"
+        }
+      }
+    },
+    {
+      "name": "Nathan Brante",
+      "models": {
+        "kokoro:voices-v1.0": {
+          "voice": "am_eric"
+        },
+        "piper:en_US-libritts-high": {
+          "speaker": 24
+        }
+      }
+    },
+    {
+      "name": "Jeanne",
+      "models": {
+        "kokoro:voices-v1.0": {
+          "voice": "if_sara"
+        },
+        "piper:en_US-libritts-high": {
+          "speaker": 15
+        }
+      }
+    }
+  ]
+}

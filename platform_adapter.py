@@ -13,10 +13,9 @@ four methods regardless of which OS it's actually running on.
 
 LinuxAdapter wraps exactly the same slop/slurp/mss/grim/aplay/paplay/evdev/
 sched_setaffinity code this project has always used — nothing about how it
-behaves on Linux changes. WindowsAdapter is new: it has not been run on an
-actual Windows machine, since this project is developed on Linux. If
-something in it doesn't work, that's the place to look — see the README's
-Windows section for what to try.
+behaves on Linux changes. WindowsAdapter is the Windows counterpart; if
+something behaves differently there than on Linux, that's the place to
+look first — see the README's Windows section for what to try.
 
 Linux also has its own internal split this file preserves: X11 (slop to
 pick a region, mss to grab pixels) vs. Wayland (slurp, grim) — see
@@ -775,15 +774,14 @@ class WindowsHotkeyWatcher(HotkeyWatcher):
     global-hotkey-style library works fine here (unlike on Linux, where
     that approach silently fails under Wayland).
 
-    UNTESTED on real Windows hardware. One known difference from the Linux
-    behavior: 'keyboard' fires its callback on Windows' own key-repeat
-    events too if the key is held down, not just the initial press (evdev
-    lets us filter to just the initial press via event.value == 1; this
-    package doesn't expose that distinction as directly). In practice this
-    should rarely matter, since run()'s existing 0.3s debounce (originally
-    added for duplicate-input-device presses) also collapses rapid repeats
-    from a held key — but a very long press could in principle toggle more
-    than once. Worth testing with an actual held keypress on Windows.
+    One known difference from the Linux behavior: 'keyboard' fires its
+    callback on Windows' own key-repeat events too if the key is held down,
+    not just the initial press (evdev lets us filter to just the initial
+    press via event.value == 1; this package doesn't expose that
+    distinction as directly). In practice this should rarely matter, since
+    run()'s existing 0.3s debounce (originally added for duplicate-input-
+    device presses) also collapses rapid repeats from a held key — but a
+    very long press could in principle toggle more than once.
     """
 
     def __init__(self, key_name: str, on_toggle, log=print):
@@ -970,10 +968,9 @@ class LinuxAdapter(PlatformAdapter):
 
 
 class WindowsAdapter(PlatformAdapter):
-    """New, and UNTESTED on real Windows hardware — see the module
-    docstring. Every method here has a Linux counterpart above doing the
-    same job with different tools; that's the pairing to check first if
-    something behaves differently on Windows than on Linux."""
+    """Every method here has a Linux counterpart above doing the same job
+    with different tools; that's the pairing to check first if something
+    behaves differently on Windows than on Linux."""
 
     def select_region(self, log=print) -> dict:
         # No slop/slurp equivalent on Windows, so instead: take a live

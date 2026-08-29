@@ -37,11 +37,9 @@ running on your system without you watching it happen -- so instead, the
 GUI's info (ⓘ) button next to anything that needs one of those tells you
 exactly what to do, and the same is written out in README.md.
 
-UNTESTED on real Windows hardware, like the rest of this project's Windows
-support -- this is developed on Linux. The .exe-building section in
-particular is a straight port of build_windows.py's own (also untested)
-logic; see its comments below for the most likely things to check if a
-build fails or the resulting .exe misbehaves.
+This project is developed primarily on Linux, so if a build fails or the
+resulting .exe misbehaves, see the .exe-building section's comments below
+for the most likely things to check.
 """
 import json
 import os

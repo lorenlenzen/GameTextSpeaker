@@ -3,15 +3,31 @@ venv/
 __pycache__/
 *.pyc
 
-# Per-user runtime state -- your screen region, popup marker, GUI settings,
-# and setup.py's remembered checkbox selections are specific to your
-# screen/game/preferences/machine, not something to share or overwrite
-# someone else's copy of. Each computer regenerates its own (via the app
-# itself for the first three; via setup.py for the last one).
-region.json
-popup_marker.json
+# Per-user runtime state -- GUI settings and setup.py's remembered checkbox
+# selections are specific to your preferences/machine, not something to
+# share or overwrite someone else's copy of. Each computer regenerates its
+# own (via the app itself for the first, via setup.py for the second).
+# (region.json/name_region.json/popup_marker.json used to live here too --
+# retired now that every region/marker lives in a profile under profiles/
+# instead of a fixed file next to the script; see the profiles/*.json rule
+# below for how those are ignored now.)
 gui_settings.json
 setup_settings.json
+
+# Full game profiles carry YOUR screen region/name_region coordinates and
+# other per-machine settings (see game_profile.py's module docstring) --
+# not something to hand to someone else or merge from a pull request. The
+# part actually worth sharing between people playing the same game is the
+# cast (who sounds like what), which the Cast window's Export Cast button
+# writes out separately into profiles/casts/*.json -- deliberately NOT
+# caught by this pattern, since "profiles/*.json" only matches files
+# directly inside profiles/, not its casts/ subfolder. See CAST_EXPORT_DIRNAME
+# and Profile.export_cast()/import_cast() in game_profile.py.
+#
+# NOTE: this only stops NEW profile files from being tracked. Any profile
+# already committed before this line was added stays tracked until you
+# explicitly run, for each one:  git rm --cached profiles/<name>.json
+profiles/*.json
 
 # Downloaded voice models -- these are large (Piper voices are 60-140MB
 # each; Kokoro's model + voices file together are ~350MB) and GitHub

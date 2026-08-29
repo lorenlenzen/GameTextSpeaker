@@ -4,11 +4,12 @@ game_text_speaker.py — OCR-to-speech accessibility pipeline for games.
 
 Watches a chosen rectangle of your screen (e.g. a dialogue box), OCRs it on
 a poll loop, and speaks new/changed text aloud via espeak-ng. Runs on Linux
-(X11 via slop+mss, or Wayland via slurp+grim) and, experimentally, Windows —
-see platform_adapter.py for exactly what differs between them.
+(X11 via slop+mss, or Wayland via slurp+grim) and Windows — see
+platform_adapter.py for exactly what differs between them.
 
 Usage:
-    # One-time: drag a box around the text area you want watched.
+    # One-time: drag a box around the text area you want watched. Saved to
+    # the "Default" profile unless --profile names another one.
     python3 game_text_speaker.py --select
 
     # Run the pipeline (uses the region saved by --select).
@@ -38,10 +39,6 @@ from platform_adapter import (
 import game_profile
 from game_profile import Observation, ink_density
 
-CONFIG_PATH = Path(__file__).with_name("region.json")
-NAME_REGION_CONFIG_PATH = Path(__file__).with_name("name_region.json")
-POPUP_MARKER_PATH = Path(__file__).with_name("popup_marker.json")
-
 # Below this, a name-region crop is treated as blank (nobody's nameplate is
 # showing -- the narrator is talking) and skipped without spending an OCR
 # call on it. See run()'s per-poll name-region capture.
@@ -61,26 +58,20 @@ def apply_cpu_affinity(affinity: str, log=print) -> None:
 
 
 # --------------------------------------------------------------------------
-# Region selection — run once, saves {x, y, w, h} to region.json
+# Region selection — run once, returns {x, y, w, h} for the caller to save
+# wherever it belongs (a profile's "region" or "name_region" field -- see
+# main() and gui.py's _adopt_selected_region()/_adopt_selected_name_region()).
+# This used to write straight to a fixed region.json/name_region.json next
+# to the script, back when a region could exist with no profile to hold it;
+# now that every region belongs to some profile, persisting it is the
+# caller's job, not this function's.
 # --------------------------------------------------------------------------
 
-def select_region(log=print, target_path=None) -> dict:
-    """`target_path` lets the same picker double as the name-region picker
-    (see NAME_REGION_CONFIG_PATH) -- it's the identical "drag a box" flow
-    either way, just saved somewhere else so the two selections never
-    clobber each other."""
-    target_path = target_path or CONFIG_PATH
+def select_region(log=print) -> dict:
     log("Drag a box around the text area you want watched (e.g. the dialogue box)...")
     region = PLATFORM.select_region(log=log)
-    target_path.write_text(json.dumps(region, indent=2))
-    log(f"Saved region {region} to {target_path}")
+    log(f"Picked region {region}.")
     return region
-
-
-def load_region() -> dict:
-    if not CONFIG_PATH.exists():
-        sys.exit("No saved region found. Run with --select first to pick one.")
-    return json.loads(CONFIG_PATH.read_text())
 
 
 # --------------------------------------------------------------------------
@@ -118,8 +109,7 @@ def select_popup_marker(log=print) -> dict:
     ref_color = average_color(capturer.grab())
 
     marker = {**marker_region, "ref_color": ref_color}
-    POPUP_MARKER_PATH.write_text(json.dumps(marker, indent=2))
-    log(f"Saved popup marker {marker} (fingerprinted color {ref_color}).")
+    log(f"Picked popup marker {marker} (fingerprinted color {ref_color}).")
     log(
         "Sanity check: watch the log for a bit with the popup CLOSED — if you "
         "see '[popup] skipping...' messages while no popup is showing, the spot "
@@ -129,13 +119,7 @@ def select_popup_marker(log=print) -> dict:
     return marker
 
 
-def load_popup_marker():
-    if not POPUP_MARKER_PATH.exists():
-        return None
-    return json.loads(POPUP_MARKER_PATH.read_text())
-
-
-def select_region_from_image(image_path: str, master=None, log=print, target_path=None) -> dict:
+def select_region_from_image(image_path: str, master=None, log=print) -> dict:
     """Fallback region picker for when the game can't be alt-tabbed away
     from (e.g. exclusive fullscreen blocks slop/slurp's overlay on Linux).
     You take a full-screen screenshot *of your desktop* while the text is
@@ -165,8 +149,6 @@ def select_region_from_image(image_path: str, master=None, log=print, target_pat
             raise RuntimeError(msg)
         sys.exit(msg)
 
-    target_path = target_path or CONFIG_PATH
-
     from PIL import Image
 
     path = Path(image_path)
@@ -191,8 +173,7 @@ def select_region_from_image(image_path: str, master=None, log=print, target_pat
     except Exception:
         pass  # best-effort check only; not fatal if mss/monitor info isn't available
 
-    target_path.write_text(json.dumps(result, indent=2))
-    log(f"Saved region {result} to {target_path}")
+    log(f"Picked region {result}.")
     return result
 
 
@@ -267,7 +248,7 @@ def _fix_stray_periods(text: str) -> str:
     return _MID_SENTENCE_PERIOD_RE.sub(repl, text)
 
 
-def clean_ocr_text(text: str) -> str:
+def clean_ocr_text(text: str, corrections=None, log=print) -> str:
     """Drop OCR/screen-artifact noise that made it past the confidence
     filter in _ocr_image_tesseract() (Tesseract only -- see ocr_image()):
     tokens with no letters or digits at all (a lone
@@ -281,14 +262,24 @@ def clean_ocr_text(text: str) -> str:
     untouched. Splitting on whitespace and rejoining with single spaces
     also folds away anything OCR reports as an odd-looking gap -- a
     non-breaking space, a doubled space -- since Python treats all of
-    those as whitespace here regardless of which exact character it was."""
+    those as whitespace here regardless of which exact character it was.
+
+    `corrections`, when given, is a profile's own "ocr_corrections" list --
+    fixes for a glyph confusion specific to THAT game's font (e.g. an
+    opening quote fused against a capital "I" into what reads as a bare
+    "T"), as opposed to everything else this function handles, which is
+    generic to Tesseract regardless of which game produced it. See
+    game_profile.apply_ocr_corrections()."""
     if not text:
         return text
     text = " ".join(tok for tok in text.split() if not _is_noise_token(tok))
+    if corrections:
+        text = game_profile.apply_ocr_corrections(text, corrections, log=log)
     return _fix_stray_periods(text)
 
 
-def ocr_image(img, lang: str, min_confidence: int = 40, engine: str = "tesseract", log=print) -> str:
+def ocr_image(img, lang: str, min_confidence: int = 40, engine: str = "tesseract", log=print,
+              corrections=None) -> str:
     """Dispatches to one of two OCR engines, then applies clean_ocr_text()
     to the result either way -- the punctuation/stray-period cleanup is
     engine-agnostic text cleanup, not something Tesseract-specific.
@@ -302,10 +293,13 @@ def ocr_image(img, lang: str, min_confidence: int = 40, engine: str = "tesseract
     no separate binary, no PATH entry. The trade-off: unlike Tesseract's
     image_to_data(), Windows' OCR API doesn't expose a per-word confidence
     score, so `min_confidence`/--ocr-min-confidence has nothing to filter
-    on and is silently ignored for this engine (see _ocr_image_windows())."""
+    on and is silently ignored for this engine (see _ocr_image_windows()).
+
+    `corrections` is passed straight through to clean_ocr_text() -- see
+    there and game_profile.apply_ocr_corrections()."""
     if engine == "windows":
-        return clean_ocr_text(_ocr_image_windows(img, lang))
-    return clean_ocr_text(_ocr_image_tesseract(img, lang, min_confidence))
+        return clean_ocr_text(_ocr_image_windows(img, lang), corrections=corrections, log=log)
+    return clean_ocr_text(_ocr_image_tesseract(img, lang, min_confidence), corrections=corrections, log=log)
 
 
 def _ocr_image_tesseract(img, lang: str, min_confidence: int) -> str:
@@ -335,8 +329,7 @@ def _ocr_image_tesseract(img, lang: str, min_confidence: int) -> str:
 
 
 def _ocr_image_windows(img, lang: str) -> str:
-    """Runs OCR via Windows.Media.Ocr (the 'winocr' package), UNTESTED on
-    real Windows hardware like the rest of this project's Windows support.
+    """Runs OCR via Windows.Media.Ocr (the 'winocr' package).
     `lang` here is a BCP-47 tag ("en", "ja", "fr", ...), NOT Tesseract's
     3-letter code ("eng", "jpn", "fra") -- these are two unrelated naming
     schemes from two unrelated OCR engines. run() maps the CLI's Tesseract-
@@ -1153,20 +1146,22 @@ def _grab_dialogue_and_name(capturer, region, name_region):
     return dialogue_img, name_img
 
 
-def run(args, stop_event=None, log=print, on_pause_change=None,
-        profile=None, on_new_speaker=None, on_speaker_ready=None,
-        on_transcript=None):
+def run(args, *, profile, stop_event=None, log=print, on_pause_change=None,
+        on_new_speaker=None, on_speaker_ready=None, on_transcript=None):
     """Runs the OCR -> speech loop until Ctrl+C (CLI) or stop_event is set
     (GUI, from a Stop button on another thread). `log` receives each status
     line — defaults to print for CLI use; the GUI passes a callback that
     forwards into its log panel instead.
 
-    `profile` is an optional game_profile.Profile supplying speaker detection
-    and the cast. Without one this loop behaves exactly as it always did, so
-    the CLI and any existing setup are unaffected. `on_new_speaker(entry,
-    line)` fires the first time a character speaks, which is what the GUI
-    hangs its "who is this?" prompt on; it must not block, since it runs on
-    this loop's thread.
+    `profile` is a required game_profile.Profile -- it's where the region,
+    popup marker, name region, cast, and OCR corrections all live now (see
+    game_profile.py's module docstring). Both callers (main()'s CLI and
+    the GUI's Start button) always have one: main() loads or creates
+    --profile (default "Default"), and the GUI guarantees one via
+    App._load_active_profile(). `on_new_speaker(entry, line)` fires the
+    first time a character speaks, which is what the GUI hangs its "who is
+    this?" prompt on; it must not block, since it runs on this loop's
+    thread.
 
     `on_transcript(who, spoken)` fires once per detected/spoken line, with
     the clean text and nothing else -- no timestamp, no "[speech]"/"[cast]"
@@ -1180,9 +1175,10 @@ def run(args, stop_event=None, log=print, on_pause_change=None,
 
     marker = None
     if args.ignore_popups:
-        marker = (profile.get("popup_marker") if profile is not None else None) or load_popup_marker()
+        marker = profile.get("popup_marker")
         if marker is None:
-            sys.exit("--ignore-popups needs a saved marker. Run with --select-popup-marker first.")
+            sys.exit(f"--ignore-popups needs a saved marker on profile '{profile.name}'. "
+                      f"Run with --select-popup-marker first.")
 
     ocr_engine = getattr(args, "ocr_engine", "tesseract") or "tesseract"
     ocr_lang = args.lang
@@ -1198,10 +1194,10 @@ def run(args, stop_event=None, log=print, on_pause_change=None,
             "per-word confidence score, so --ocr-min-confidence has no effect."
         )
 
-    # The profile owns the region when there is one -- that's what makes
-    # switching games a dropdown instead of re-dragging the box. region.json
-    # remains the fallback for the CLI and for anyone with no profile.
-    region = (profile.get("region") if profile is not None else None) or load_region()
+    region = profile.get("region")
+    if not region:
+        sys.exit(f"No region set for profile '{profile.name}'. Run with --select first "
+                  f"(or pick one from the GUI's \"Select Region\" button).")
     capturer = PLATFORM.make_capturer(region)
     speaker = None if args.quiet else Speaker(
         engine=args.engine, rate=args.rate, voice=args.voice, piper_model=args.piper_model,
@@ -1223,7 +1219,7 @@ def run(args, stop_event=None, log=print, on_pause_change=None,
     model_key = game_profile.model_key(
         args.engine,
         piper_model=getattr(args, "piper_model", None),
-        kokoro_model=getattr(args, "kokoro_model", None),
+        kokoro_voices=getattr(args, "kokoro_voices", None),
     )
 
     if speaker is not None and on_speaker_ready:
@@ -1314,7 +1310,7 @@ def run(args, stop_event=None, log=print, on_pause_change=None,
             # dialogue text plainly has one. One grab removes that race
             # instead of dodging it.
             name_raw = None
-            name_region = profile.get("name_region") if profile is not None else None
+            name_region = profile.get("name_region")
             if name_region:
                 try:
                     raw, name_raw = _grab_dialogue_and_name(capturer, region, name_region)
@@ -1327,8 +1323,11 @@ def run(args, stop_event=None, log=print, on_pause_change=None,
 
             img = preprocess_for_ocr(raw)
             min_conf = getattr(args, "ocr_min_confidence", 40)
+            # This game's own OCR font-quirk fixes -- see
+            # game_profile.apply_ocr_corrections().
+            ocr_corrections = profile.get("ocr_corrections")
             text = ocr_image(img, lang=ocr_lang, min_confidence=min_conf,
-                              engine=ocr_engine, log=log)
+                              engine=ocr_engine, log=log, corrections=ocr_corrections)
 
             # Compare BEFORE the speaker name is stripped or announced, so the
             # dedup check sees the same shape of string every poll. Deciding
@@ -1348,7 +1347,8 @@ def run(args, stop_event=None, log=print, on_pause_change=None,
                     name_text = ""
                     if name_raw is not None and ink_density(name_raw) >= NAME_REGION_MIN_INK:
                         name_text = ocr_image(preprocess_for_ocr(name_raw), lang=ocr_lang,
-                                               min_confidence=min_conf, engine=ocr_engine, log=log)
+                                               min_confidence=min_conf, engine=ocr_engine, log=log,
+                                               corrections=ocr_corrections)
 
                     name, dialogue = profile.detect(Observation(text, name_text))
                     freeze = bool(profile.get("freeze_cast", False))
@@ -1424,6 +1424,10 @@ def run(args, stop_event=None, log=print, on_pause_change=None,
 
 def main():
     parser = argparse.ArgumentParser(description="OCR game text on screen and speak it aloud.")
+    parser.add_argument("--profile", default="Default", metavar="NAME",
+                         help="Game profile to use (default 'Default') -- holds the region, popup "
+                              "marker, and (once a name region is set from the GUI) the per-character "
+                              "cast. Created automatically the first time it's used. See profiles/.")
     parser.add_argument("--select", action="store_true", help="Interactively pick the screen region to watch (live, click-and-drag over the screen).")
     parser.add_argument("--select-from-image", metavar="PATH", default="",
                          help="Pick the region from a saved screenshot instead of live (use when you can't alt-tab to a terminal over a fullscreen game, e.g. a Steam F12 screenshot).")
@@ -1513,14 +1517,28 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    # Every selection/run below acts on one profile -- created on first use
+    # (see game_profile.create_profile()) so a brand-new "--profile Foo"
+    # just works instead of needing a separate setup step.
+    game_profile.PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    profile_path = game_profile.PROFILE_DIR / f"{game_profile.slugify(args.profile)}.json"
+    if profile_path.exists():
+        profile = game_profile.load_profile(profile_path)
+    else:
+        profile = game_profile.create_profile(args.profile)
+        print(f"Created new profile '{args.profile}' (profiles/{profile_path.name}).")
+
     if args.select:
-        select_region()
+        profile.set("region", select_region())
+        profile.save_if_dirty()
     if args.select_from_image:
-        select_region_from_image(args.select_from_image)
+        profile.set("region", select_region_from_image(args.select_from_image))
+        profile.save_if_dirty()
     if args.select_popup_marker:
-        select_popup_marker()
+        profile.set("popup_marker", select_popup_marker())
+        profile.save_if_dirty()
     if args.run:
-        run(args)
+        run(args, profile=profile)
 
 
 if __name__ == "__main__":
